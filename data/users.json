@@ -1,0 +1,34 @@
+[
+  {
+    "id": "admin-001",
+    "name": "System Admin",
+    "email": "admin@gmail.com",
+    "phone": "0000000000",
+    "password": "$2b$10$2nVzjCquY9202R8bBa4Z7esNORRqL9b/Ed8K40SBOmGrY1EauFBjG",
+    "role": "admin"
+  },
+  {
+    "id": "1779876550281",
+    "name": "Soundarya",
+    "email": "soundaryaram2016@gmail.com",
+    "phone": "7550333488",
+    "password": "$2b$10$L/TyMrlgPCADogi.uXor1uyAMWGp7zc9OrB1pu0i8Wcetp6C6LPOO",
+    "role": "user"
+  },
+  {
+    "id": "1779876686334",
+    "name": "Soundarya",
+    "email": "soundaryasomu.s@gmail.com",
+    "phone": "99942997772",
+    "password": "$2b$10$Xl.Sx1DxkzhVPHZp5qgoBuT.l1LgRI3SlJs.tMUKsHEOSMPmbeJYi",
+    "role": "user"
+  },
+  {
+    "id": "1779876787032",
+    "name": "Soundarya",
+    "email": "soundaryasomu@gmail.com",
+    "phone": "99942997772",
+    "password": "$2b$10$izsngWCcshygllsShAf8..iZZHQWjHXVJVKWc0gwgraKC0cAAjylK",
+    "role": "admin"
+  }
+]

@@ -1,0 +1,8 @@
+{
+  "name": "TimeTracker Pro",
+  "description": "A professional employee time tracking system with GPS location capturing and admin reporting tools.",
+  "requestFramePermissions": [
+    "geolocation"
+  ],
+  "majorCapabilities": []
+}
