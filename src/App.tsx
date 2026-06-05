@@ -132,37 +132,87 @@ const getActiveBreakWindow = (now: Date): 'morning' | 'lunch' | 'evening' | null
 
 // --- Utils ---
 
+const IDLE_DEDUCT_MIN = 30; // only deduct sleep gaps longer than 30 minutes
+
 const calculateTotalHours = (dailyLogs: TimeLog[]) => {
-  if (dailyLogs.length === 0) return { hours: 0, minutes: 0, totalMinutes: 0 };
+  if (dailyLogs.length === 0) return { hours: 0, minutes: 0, totalMinutes: 0, idleDeductedMinutes: 0 };
 
   let totalMinutes = 0;
+  let idleDeductedMinutes = 0;
   let lastPunchIn: Date | null = null;
+  let lastIdleStart: Date | null = null;
 
-  // Sort logs by time
-  const sorted = [...dailyLogs].sort((a, b) => new Date(a.timestamp).getTime() - new Date(b.timestamp).getTime());
+  // Sort all relevant logs by time — include idle events for sleep deduction
+  const sorted = [...dailyLogs]
+    .filter(l => !['location_update', 'daily_report'].includes(l.type))
+    .sort((a, b) => new Date(a.timestamp).getTime() - new Date(b.timestamp).getTime());
 
   sorted.forEach(log => {
     const time = new Date(log.timestamp);
-    // Events that START or RESUME work
+
     if (log.type === 'login' || log.type === 'lunch_out' || log.type === 'break_end') {
       lastPunchIn = time;
+      lastIdleStart = null; // clear any pending idle on resume events
     }
-    // Events that PAUSE work
+    else if (log.type === 'idle_start') {
+      // Pause accumulation — system went to sleep
+      if (lastPunchIn) {
+        totalMinutes += differenceInMinutes(time, lastPunchIn);
+        lastPunchIn = null;
+      }
+      lastIdleStart = time;
+    }
+    else if (log.type === 'idle_end') {
+      if (lastIdleStart) {
+        const gapMins = differenceInMinutes(time, lastIdleStart);
+        if (gapMins >= IDLE_DEDUCT_MIN) {
+          // Real sleep (≥20 min) — gap already excluded, record deduction
+          idleDeductedMinutes += gapMins;
+        } else {
+          // Short gap (<20 min) — give benefit of doubt, add time back
+          totalMinutes += gapMins;
+        }
+        lastIdleStart = null;
+      }
+      lastPunchIn = time; // resume work
+    }
     else if ((log.type === 'logout' || log.type === 'lunch_in' || log.type === 'break_start') && lastPunchIn) {
       totalMinutes += differenceInMinutes(time, lastPunchIn);
       lastPunchIn = null;
+      lastIdleStart = null;
     }
   });
 
-  // If currently punched in (no logout yet), accumulate to now
-  if (lastPunchIn) {
-    totalMinutes += differenceInMinutes(new Date(), lastPunchIn);
+  // Still working (no logout) — accumulate to now for today; cap at 6:40 PM for past days
+  if (lastPunchIn && !lastIdleStart) {
+    const punchDate = new Date(lastPunchIn);
+    const now = new Date();
+    const isToday = punchDate.toDateString() === now.toDateString();
+    // For past days with no logout, cap at auto-punchout time (6:40 PM)
+    const capTime = isToday ? now : new Date(
+      punchDate.getFullYear(), punchDate.getMonth(), punchDate.getDate(), 18, 40, 0
+    );
+    totalMinutes += differenceInMinutes(capTime, lastPunchIn);
+  }
+  // Currently in sleep — if gap is still < 20 min, count it; else don't
+  if (lastIdleStart && !lastPunchIn) {
+    const idleDate = new Date(lastIdleStart);
+    const now = new Date();
+    const isToday = idleDate.toDateString() === now.toDateString();
+    const capTime = isToday ? now : new Date(
+      idleDate.getFullYear(), idleDate.getMonth(), idleDate.getDate(), 18, 40, 0
+    );
+    const gapNow = differenceInMinutes(capTime, lastIdleStart);
+    if (isToday && gapNow < IDLE_DEDUCT_MIN) totalMinutes += gapNow;
+    // else: past day or ≥20 min sleep — don't count
   }
 
+  totalMinutes = Math.max(0, totalMinutes);
   return {
     hours: Math.floor(totalMinutes / 60),
     minutes: totalMinutes % 60,
-    totalMinutes
+    totalMinutes,
+    idleDeductedMinutes,
   };
 };
 
@@ -209,11 +259,14 @@ const MonthlyWorkCalendar = ({ logs }: { logs: TimeLog[] }) => {
       const punchIn      = loginLog  ? format(new Date(loginLog.timestamp),  'h:mm a') : null;
       const punchOut     = logoutLog ? format(new Date(logoutLog.timestamp), 'h:mm a') : null;
 
+      const isCurrentDay = isToday(day);
       let status: 'present' | 'half' | 'absent' | 'weekend' | 'future' = 'future';
       if (isFuture)        status = 'future';
       else if (isWeekend)  status = 'weekend';
+      else if (isCurrentDay && loginLog) status = 'present'; // today with login → always present (still working)
       else if (totalMinutes >= 480)  status = 'present';   // ≥8h
       else if (totalMinutes >= 60)   status = 'half';      // 1–7.9h
+      else if (loginLog)              status = 'half';     // has login but low hours (half day)
       else                            status = 'absent';
 
       return {
@@ -572,9 +625,20 @@ const DayAttendanceModal = ({ date, isOpen, onClose, token }: { date: Date, isOp
     }
   }, [isOpen, date, token]);
 
+  // Late = punched in after 9:35 AM (9:30 scheduled + 5-min grace)
+  const isLate = (item: any): boolean => {
+    if (!item.punchInTime) return false;
+    const t = new Date(item.punchInTime);
+    return t.getHours() > 9 || (t.getHours() === 9 && t.getMinutes() > 35);
+  };
+
   const filteredData = data.filter(item => {
     const matchesSearch = item.user.name.toLowerCase().includes(search.toLowerCase());
-    const matchesFilter = filter === 'all' || item.status === filter;
+    const matchesFilter =
+      filter === 'all'    ? true :
+      filter === 'late'   ? isLate(item) :
+      filter === 'present'? item.status !== 'absent' :
+                            item.status === filter;
     return matchesSearch && matchesFilter;
   });
 
@@ -725,11 +789,14 @@ const DayAttendanceModal = ({ date, isOpen, onClose, token }: { date: Date, isOp
                         });
                         const overtimeMins = Math.max(0, totalMinutes - 480);
 
+                        const derivedStatus = isLate(item) && item.status !== 'absent' ? 'late' : item.status;
                         const statusColors: any = {
-                          present: 'bg-emerald-50 text-emerald-600',
-                          late: 'bg-amber-50 text-amber-600 ring-1 ring-amber-100',
-                          absent: 'bg-red-50 text-red-600',
-                          'half-day': 'bg-indigo-50 text-indigo-600'
+                          present:  'bg-emerald-50 text-emerald-600',
+                          left:     'bg-sky-50 text-sky-600',
+                          late:     'bg-amber-50 text-amber-600 ring-1 ring-amber-100',
+                          absent:   'bg-red-50 text-red-600',
+                          on_break: 'bg-purple-50 text-purple-600',
+                          'half-day': 'bg-indigo-50 text-indigo-600',
                         };
                         
                         return (
@@ -778,8 +845,8 @@ const DayAttendanceModal = ({ date, isOpen, onClose, token }: { date: Date, isOp
                                </span>
                              </td>
                              <td className="px-6 py-4">
-                               <span className={`px-2.5 py-1 rounded-lg text-[9px] font-black uppercase tracking-widest ${statusColors[item.status]}`}>
-                                 {item.status}
+                               <span className={`px-2.5 py-1 rounded-lg text-[9px] font-black uppercase tracking-widest ${statusColors[derivedStatus] ?? 'bg-gray-50 text-gray-500'}`}>
+                                 {derivedStatus}
                                </span>
                              </td>
                              <td className="px-6 py-4 text-right">
@@ -804,7 +871,7 @@ const DayAttendanceModal = ({ date, isOpen, onClose, token }: { date: Date, isOp
                  </div>
                  <div>
                     <p className="text-[10px] font-black text-gray-400 uppercase tracking-widest mb-1">Late Arrivals</p>
-                    <p className="text-xl font-black text-amber-500">{data.filter(i => i.status === 'late').length}</p>
+                    <p className="text-xl font-black text-amber-500">{data.filter(i => isLate(i) && i.status !== 'absent').length}</p>
                  </div>
                  <div>
                     <p className="text-[10px] font-black text-gray-400 uppercase tracking-widest mb-1">Absentees</p>
@@ -2036,10 +2103,10 @@ const RegisterPage = () => {
 // ── Notification Bell ─────────────────────────────────────────────────────────
 type AppNotification = {
   id: string;
-  type: 'overdue' | 'due_today' | 'due_soon';
+  type: 'overdue' | 'due_today' | 'due_soon' | 'auto_punchout_warning' | 'auto_punchout' | 'auto_punchout_warning_lead' | 'auto_punchout_summary';
   message: string;
   sub: string;
-  taskId: string;
+  taskId?: string;
   read: boolean;
 };
 
@@ -2113,21 +2180,44 @@ const NotificationBell = () => {
   const fetchNotifications = async () => {
     if (!token) return;
     try {
+      // Fetch system notifications (auto punch-out alerts)
+      const sysRes = await apiFetch('/api/notifications', { headers: { Authorization: `Bearer ${token}` } });
+      const sysNotifs: AppNotification[] = [];
+      if (sysRes.ok) {
+        const sysData = await sysRes.json();
+        const typeLabels: Record<string, string> = {
+          auto_punchout_warning:      'Punch-Out Warning',
+          auto_punchout:              'Auto Punched Out',
+          auto_punchout_warning_lead: 'Punch-Out Warning',
+          auto_punchout_summary:      'Auto Punch-Out',
+        };
+        for (const n of sysData) {
+          if (!typeLabels[n.type]) continue;
+          sysNotifs.push({
+            id:      `sys-${n.id}`,
+            type:    n.type as AppNotification['type'],
+            message: n.title,
+            sub:     n.message,
+            read:    n.isRead || readIds.has(`sys-${n.id}`),
+          });
+        }
+      }
+
       if (user?.role === 'user') {
         const res = await apiFetch('/api/tasks', { headers: { Authorization: `Bearer ${token}` } });
-        if (!res.ok) return;
+        if (!res.ok) { setNotifications(sysNotifs); return; }
         const tasks: Task[] = await res.json();
-        setNotifications(buildNotifications(tasks));
+        setNotifications([...sysNotifs, ...buildNotifications(tasks)]);
       } else {
         const [taskRes, teamRes] = await Promise.all([
           apiFetch('/api/tasks',          { headers: { Authorization: `Bearer ${token}` } }),
           apiFetch('/api/teamlead/data',  { headers: { Authorization: `Bearer ${token}` } }),
         ]);
-        if (!taskRes.ok) return;
-        const tasks: Task[]      = await taskRes.json();
-        const teamData           = teamRes.ok ? await teamRes.json() : {};
+        if (!taskRes.ok) { setNotifications(sysNotifs); return; }
+        const tasks: Task[]        = await taskRes.json();
+        const teamData             = teamRes.ok ? await teamRes.json() : {};
         const allUsers: UserType[] = Array.isArray(teamData.users) ? teamData.users : [];
-        setNotifications(buildNotifications(tasks, allUsers));
+        setNotifications([...sysNotifs, ...buildNotifications(tasks, allUsers)]);
       }
     } catch (_) {}
   };
@@ -2157,6 +2247,8 @@ const NotificationBell = () => {
     const newIds = new Set([...readIds, ...notifications.map(n => n.id)]);
     setReadIds(newIds);
     localStorage.setItem('notif_read', JSON.stringify([...newIds]));
+    // Mark server-side system notifications read
+    if (token) apiFetch('/api/notifications/read', { method: 'PUT', headers: { Authorization: `Bearer ${token}` } }).catch(() => {});
   };
 
   const markRead = (id: string) => {
@@ -2165,11 +2257,15 @@ const NotificationBell = () => {
     localStorage.setItem('notif_read', JSON.stringify([...newIds]));
   };
 
-  const typeStyle = {
-    overdue:  { bg: 'bg-rose-50',   border: 'border-rose-200',   dot: 'bg-rose-500',   label: 'Overdue',   lbg: 'bg-rose-100 text-rose-700'   },
-    due_today:{ bg: 'bg-amber-50',  border: 'border-amber-200',  dot: 'bg-amber-500',  label: 'Due Today', lbg: 'bg-amber-100 text-amber-700'  },
-    due_soon: { bg: 'bg-blue-50',   border: 'border-blue-200',   dot: 'bg-blue-400',   label: 'Due Soon',  lbg: 'bg-blue-100 text-blue-700'    },
-  } as const;
+  const typeStyle: Record<string, { bg: string; border: string; dot: string; label: string; lbg: string }> = {
+    overdue:                   { bg: 'bg-rose-50',   border: 'border-rose-200',   dot: 'bg-rose-500',   label: 'Overdue',      lbg: 'bg-rose-100 text-rose-700'    },
+    due_today:                 { bg: 'bg-amber-50',  border: 'border-amber-200',  dot: 'bg-amber-500',  label: 'Due Today',    lbg: 'bg-amber-100 text-amber-700'  },
+    due_soon:                  { bg: 'bg-blue-50',   border: 'border-blue-200',   dot: 'bg-blue-400',   label: 'Due Soon',     lbg: 'bg-blue-100 text-blue-700'    },
+    auto_punchout_warning:     { bg: 'bg-amber-50',  border: 'border-amber-300',  dot: 'bg-amber-500',  label: 'Punch-Out',    lbg: 'bg-amber-100 text-amber-700'  },
+    auto_punchout:             { bg: 'bg-indigo-50', border: 'border-indigo-200', dot: 'bg-indigo-500', label: 'Auto Logout',  lbg: 'bg-indigo-100 text-indigo-700'},
+    auto_punchout_warning_lead:{ bg: 'bg-amber-50',  border: 'border-amber-300',  dot: 'bg-amber-500',  label: 'Team Alert',   lbg: 'bg-amber-100 text-amber-700'  },
+    auto_punchout_summary:     { bg: 'bg-indigo-50', border: 'border-indigo-200', dot: 'bg-indigo-500', label: 'Auto Logout',  lbg: 'bg-indigo-100 text-indigo-700'},
+  };
 
   return (
     <div ref={ref} className="relative">
@@ -2249,7 +2345,7 @@ const NotificationBell = () => {
                 <p className="text-[10px] text-gray-400 font-semibold">
                   {notifications.filter(n => n.type === 'overdue').length} overdue ·{' '}
                   {notifications.filter(n => n.type === 'due_today').length} due today ·{' '}
-                  {notifications.filter(n => n.type === 'due_soon').length} due in 3 days
+                  {notifications.filter(n => ['auto_punchout_warning','auto_punchout','auto_punchout_warning_lead','auto_punchout_summary'].includes(n.type)).length} punch-out alerts
                 </p>
               </div>
             )}
@@ -2409,6 +2505,69 @@ const LOG_COLORS: Record<string, string> = {
   idle_end:    'bg-teal-400 ring-teal-300',
 };
 
+// ── Submit Answer Box (employee answers a task) ───────────────────────────────
+const SubmitAnswerBox = ({ taskId, token, onSubmitted }: { taskId: string; token: string | null; onSubmitted: () => void }) => {
+  const [answer, setAnswer] = React.useState('');
+  const [loading, setLoading] = React.useState(false);
+  const [error, setError] = React.useState('');
+  const [submitted, setSubmitted] = React.useState(false);
+
+  const submit = async () => {
+    if (!answer.trim()) { setError('Please write your answer before submitting'); return; }
+    setLoading(true); setError('');
+    try {
+      const res = await apiFetch(`/api/tasks/${taskId}/submit`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+        body: JSON.stringify({ submission: answer }),
+      });
+      if (!res.ok) { const j = await res.json(); throw new Error(j.error || 'Failed'); }
+      setSubmitted(true);
+      onSubmitted();
+    } catch (e: any) { setError(e.message); }
+    finally { setLoading(false); }
+  };
+
+  if (submitted) return (
+    <div className="mt-3 bg-emerald-50 border border-emerald-200 rounded-xl p-3">
+      <p className="text-xs font-black text-emerald-600">✅ Answer submitted successfully!</p>
+    </div>
+  );
+
+  return (
+    <div className="mt-3 bg-gray-50 border-2 border-indigo-100 rounded-xl p-3 space-y-2">
+      <p className="text-[10px] font-black text-indigo-600 uppercase tracking-widest flex items-center gap-1.5">
+        <FileText size={11} /> Post Your Answer / Solution
+      </p>
+      <textarea
+        rows={5}
+        placeholder={"Type or paste your answer here...\n\nExample:\nfunction solution() {\n  // your code\n}"}
+        className="w-full px-3 py-2.5 bg-gray-900 border border-gray-700 rounded-xl text-[12px] font-mono text-green-300 placeholder-gray-600 outline-none focus:ring-2 focus:ring-indigo-500 resize-y leading-relaxed"
+        value={answer}
+        onChange={e => setAnswer(e.target.value)}
+        onKeyDown={e => {
+          if (e.key === 'Tab') {
+            e.preventDefault();
+            const el = e.currentTarget;
+            const s = el.selectionStart;
+            const newVal = el.value.substring(0, s) + '  ' + el.value.substring(el.selectionEnd);
+            setAnswer(newVal);
+            setTimeout(() => { el.selectionStart = el.selectionEnd = s + 2; }, 0);
+          }
+        }}
+      />
+      {error && <p className="text-[11px] text-red-500 font-bold">{error}</p>}
+      <button
+        onClick={submit}
+        disabled={loading || !answer.trim()}
+        className="w-full py-2.5 rounded-xl bg-indigo-600 text-white text-xs font-black hover:bg-indigo-700 transition-all disabled:opacity-40 flex items-center justify-center gap-2"
+      >
+        {loading ? 'Submitting...' : '✅ Submit Answer to Team Lead'}
+      </button>
+    </div>
+  );
+};
+
 const UserDashboard = () => {
   const { user, token } = useAuth();
   const [logs, setLogs] = useState<TimeLog[]>([]);
@@ -2419,6 +2578,13 @@ const UserDashboard = () => {
   const [currentTime, setCurrentTime] = useState(new Date());
   const [showFinishModal, setShowFinishModal] = useState(false);
   const [isIdleWarning, setIsIdleWarning] = useState(false);  // show warning on employee screen
+  const [locationError, setLocationError] = useState<string | null>(null); // location permission error
+  // Ref to track optimistic action — prevents fetchLogs from overwriting it too early
+  const pendingActionRef = React.useRef<string | null>(null);
+  // Ref to prevent duplicate submissions within 3 seconds
+  const lastSubmitTimeRef = React.useRef<Record<string, number>>({});
+  // Ref so idle detection always reads latest lastAction without stale closure
+  const lastActionRef = React.useRef<string | null>(null);
 
   // Real-time clock — ticks every second so Active Hours stays live
   useEffect(() => {
@@ -2426,15 +2592,61 @@ const UserDashboard = () => {
     return () => clearInterval(timer);
   }, []);
 
-  const fetchLogs = async () => {
+  const fetchLogs = async (autoFixIdle = false) => {
     try {
       const res = await apiFetch('/api/logs', { headers: { Authorization: `Bearer ${token}` } });
       if (!res.ok) return;
       const data = await res.json();
       const logs = Array.isArray(data) ? data : [];
       setLogs(logs);
-      const lastPunchLog = [...logs].reverse().find((l: TimeLog) => l.type !== 'daily_report' && l.type !== 'idle_start' && l.type !== 'idle_end');
-      if (lastPunchLog) setLastAction(lastPunchLog.type);
+
+      // Auto-fix stale idle_start: if the most recent idle_start has no idle_end after it,
+      // the system is clearly ON now (we're running this code), so send idle_end to clear it.
+      if (autoFixIdle) {
+        const todayStr = new Date().toISOString().slice(0, 10);
+        const todayLogs = logs.filter((l: TimeLog) => l.timestamp.startsWith(todayStr));
+        const sorted = [...todayLogs].sort((a: TimeLog, b: TimeLog) =>
+          new Date(a.timestamp).getTime() - new Date(b.timestamp).getTime()
+        );
+        const lastIdleStart = [...sorted].reverse().find((l: TimeLog) => l.type === 'idle_start');
+        const lastIdleEnd   = [...sorted].reverse().find((l: TimeLog) => l.type === 'idle_end');
+        const hasStaleIdle  = lastIdleStart && (
+          !lastIdleEnd ||
+          new Date(lastIdleEnd.timestamp) < new Date(lastIdleStart.timestamp)
+        );
+        if (hasStaleIdle) {
+          // System is ON right now — clear the stale idle_start automatically
+          await apiFetch('/api/logs', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+            body: JSON.stringify({ type: 'idle_end', note: 'Auto-cleared: system is active' }),
+          });
+          setIsIdleWarning(false);
+          // Re-fetch to get the updated logs
+          const res2 = await apiFetch('/api/logs', { headers: { Authorization: `Bearer ${token}` } });
+          if (res2.ok) {
+            const data2 = await res2.json();
+            setLogs(Array.isArray(data2) ? data2 : []);
+          }
+          return;
+        }
+      }
+
+      // Only derive lastAction from TODAY's logs — yesterday's state must not affect today
+      const todayStr = new Date().toISOString().slice(0, 10);
+      const todayOnly = logs.filter((l: TimeLog) => l.timestamp.startsWith(todayStr));
+      const lastPunchLog = [...todayOnly].reverse().find((l: TimeLog) =>
+        !['daily_report','idle_start','idle_end','location_update'].includes(l.type)
+      );
+      if (!pendingActionRef.current) {
+        // No pending action — set from server data
+        setLastAction(lastPunchLog?.type ?? null);
+      } else if (pendingActionRef.current === lastPunchLog?.type) {
+        // Server confirmed the pending action
+        setLastAction(lastPunchLog.type);
+        pendingActionRef.current = null;
+      }
+      // else: pending action not confirmed yet — keep optimistic state
     } catch (err) { console.error(err); }
   };
 
@@ -2447,88 +2659,124 @@ const UserDashboard = () => {
     } catch (err) { console.error(err); }
   };
 
-  useEffect(() => { fetchLogs(); fetchTasks(); }, []);
-
-  // ── Idle / sleep detection ────────────────────────────────────────────
-  // Fires idle_start after 15 min of no mouse/keyboard OR if system wakes
-  // from sleep having been gone ≥15 min. Fires idle_end on resume.
   useEffect(() => {
-    const IDLE_MS   = 15 * 60 * 1000; // 15 minutes
-    let idleTimer: ReturnType<typeof setTimeout> | null = null;
-    let idleSent    = false;
-    let hiddenAt: number | null = null;
-    let lastTick    = Date.now();
+    fetchLogs(true);
+    fetchTasks();
+    // Auto-refresh every 30s — keeps hours live and clears stale idle after system wakes
+    const interval = setInterval(() => { fetchLogs(false); fetchTasks(); }, 30_000);
+    return () => clearInterval(interval);
+  }, []);
 
-    const postIdleEvent = async (type: 'idle_start' | 'idle_end') => {
+  // ── Sleep / screen-lock detection (system-level only) ───────────────
+  // Uses heartbeat gap: if setInterval fires 15+ min late → system was asleep/locked.
+  // Does NOT use mouse/keyboard (those are browser-only, employee may work in other apps).
+  // 15 min sleep → warn employee + notify team lead
+  // 20 min sleep → time is deducted from working hours
+  useEffect(() => {
+    const NOTIFY_GAP_MS = 30 * 60 * 1000; // 30 min sleep gap → warn
+    const DEDUCT_GAP_MS = 30 * 60 * 1000; // 30 min sleep gap → deduct
+    let lastTick = Date.now();
+    let idleSent = false;
+    let idleStartedAt: number | null = null;
+
+    const isActivelyWorking = () => {
+      const a = lastActionRef.current;
+      return a === 'login' || a === 'break_end' || a === 'lunch_out';
+    };
+
+    const postIdleEvent = async (type: 'idle_start' | 'idle_end', note?: string) => {
       try {
         await apiFetch('/api/logs', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
-          body: JSON.stringify({ type, note: type === 'idle_start' ? 'System idle / screen off' : 'Activity resumed' }),
+          body: JSON.stringify({ type, note }),
         });
         fetchLogs();
       } catch (_) {}
     };
 
-    const triggerIdle = () => {
-      if (idleSent) return;
+    const triggerSleepIdle = (gapMs: number) => {
+      if (idleSent || !isActivelyWorking()) return;
       idleSent = true;
+      // Back-date idle_start to when the system actually went to sleep
+      idleStartedAt = Date.now() - gapMs;
       setIsIdleWarning(true);
-      postIdleEvent('idle_start');
+      const gapMins = Math.round(gapMs / 60000);
+      postIdleEvent('idle_start', `System was asleep / screen locked for ${gapMins} minutes`);
     };
 
-    const resumeFromIdle = () => {
+    const resumeFromSleep = () => {
       if (!idleSent) return;
       idleSent = false;
       setIsIdleWarning(false);
-      postIdleEvent('idle_end');
+      const idleMs = idleStartedAt ? Date.now() - idleStartedAt : 0;
+      const idleMinutes = Math.round(idleMs / 60000);
+      const deducted = idleMs >= DEDUCT_GAP_MS;
+      const note = deducted
+        ? `System resumed after ${idleMinutes} min sleep — ${idleMinutes} min deducted from working hours`
+        : `System resumed after ${idleMinutes} min (under 20 min, no deduction)`;
+      idleStartedAt = null;
+      postIdleEvent('idle_end', note);
     };
 
-    const resetTimer = () => {
-      resumeFromIdle();
-      if (idleTimer) clearTimeout(idleTimer);
-      idleTimer = setTimeout(triggerIdle, IDLE_MS);
-    };
-
-    // Detect laptop wake-from-sleep: if setInterval tick fires late by ≥15 min, system slept
+    // Heartbeat: fires every 30 seconds. If it fires late by ≥15 min,
+    // the system was asleep or the screen was locked.
     const sleepWatcher = setInterval(() => {
-      const now  = Date.now();
-      const gap  = now - lastTick;
-      lastTick   = now;
-      if (gap >= IDLE_MS) {
-        // System was asleep for ≥15 min
-        triggerIdle();
+      const now = Date.now();
+      const gap = now - lastTick;
+      lastTick = now;
+
+      if (!isActivelyWorking()) {
+        // Employee not working — clear any stale idle state
+        if (idleSent) resumeFromSleep();
+        return;
       }
-    }, 10_000); // check every 10 s
 
-    // Visibility change — tab/screen hidden then shown
-    const onVisibility = () => {
-      if (document.visibilityState === 'hidden') {
-        hiddenAt = Date.now();
-      } else {
-        if (hiddenAt !== null) {
-          const away = Date.now() - hiddenAt;
-          hiddenAt = null;
-          if (away >= IDLE_MS) triggerIdle();
-          else resetTimer();
-        }
+      if (gap >= NOTIFY_GAP_MS) {
+        // System was asleep/locked for 15+ min
+        triggerSleepIdle(gap);
+      } else if (idleSent) {
+        // System is back and was previously idle — resume
+        resumeFromSleep();
       }
-    };
-
-    const activityEvents = ['mousemove', 'mousedown', 'keydown', 'touchstart', 'scroll'] as const;
-    activityEvents.forEach(e => document.addEventListener(e, resetTimer, { passive: true }));
-    document.addEventListener('visibilitychange', onVisibility);
-
-    // Kick off the initial idle countdown (only if already working)
-    resetTimer();
+    }, 30_000); // check every 30 seconds
 
     return () => {
-      if (idleTimer) clearTimeout(idleTimer);
       clearInterval(sleepWatcher);
-      activityEvents.forEach(e => document.removeEventListener(e, resetTimer));
-      document.removeEventListener('visibilitychange', onVisibility);
     };
-  }, [token]); // re-run if token changes
+  }, [token]);
+
+  // ── Continuous location tracking (every 5 minutes while logged in) ───
+  useEffect(() => {
+    const LOCATION_INTERVAL_MS = 5 * 60 * 1000; // 5 minutes
+
+    const sendLocation = () => {
+      // Only track if employee is actively working (not on break/lunch/logged out)
+      const isActivelyWorking = lastAction === 'login' || lastAction === 'break_end' || lastAction === 'lunch_out';
+      if (!isActivelyWorking || !token) return;
+
+      if (!navigator.geolocation) return;
+
+      navigator.geolocation.getCurrentPosition(
+        pos => {
+          apiFetch('/api/logs', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+            body: JSON.stringify({
+              type: 'location_update',
+              location: { lat: pos.coords.latitude, lng: pos.coords.longitude },
+              note: 'Auto location update',
+            }),
+          }).catch(() => {});
+        },
+        () => {}, // silently ignore geolocation errors
+        { timeout: 10000, maximumAge: 60000, enableHighAccuracy: true }
+      );
+    };
+
+    const interval = setInterval(sendLocation, LOCATION_INTERVAL_MS);
+    return () => clearInterval(interval);
+  }, [token, lastAction]);
 
   const submitPunchEvent = async (type: string, location: { lat: number; lng: number } | null) => {
     try {
@@ -2538,18 +2786,58 @@ const UserDashboard = () => {
         body: JSON.stringify({ type, location, note }),
       });
       if (res.ok) { setNote(''); fetchLogs(); }
-    } catch (err) { console.error('Punch event failed:', err); }
+      else { pendingActionRef.current = null; } // clear on failure
+    } catch (err) { console.error('Punch event failed:', err); pendingActionRef.current = null; }
     finally { setLoading(false); }
   };
 
   const handleAction = (type: string) => {
+    // Prevent duplicate submissions of the same type within 3 seconds
+    const now = Date.now();
+    const lastTime = lastSubmitTimeRef.current[type] ?? 0;
+    if (now - lastTime < 3000) return;
+    lastSubmitTimeRef.current[type] = now;
+
+    setLocationError(null);
+
+    // Location is MANDATORY for punch-in (login)
+    if (type === 'login') {
+      if (!navigator.geolocation) {
+        setLocationError('Your device does not support GPS. Please use a device with location support to punch in.');
+        return;
+      }
+      setLoading(true);
+      pendingActionRef.current = type;
+      navigator.geolocation.getCurrentPosition(
+        pos => {
+          setLastAction(type); // optimistic update only after location confirmed
+          submitPunchEvent(type, { lat: pos.coords.latitude, lng: pos.coords.longitude });
+        },
+        err => {
+          setLoading(false);
+          pendingActionRef.current = null;
+          if (err.code === 1) {
+            setLocationError('📍 Location permission denied. Please allow location access in your browser settings to punch in.');
+          } else if (err.code === 2) {
+            setLocationError('📍 Location unavailable. Make sure GPS is enabled on your device.');
+          } else {
+            setLocationError('📍 Location request timed out. Please try again.');
+          }
+        },
+        { timeout: 10000, maximumAge: 0, enableHighAccuracy: true }
+      );
+      return;
+    }
+
+    // For all other actions, location is captured but not mandatory
     setLoading(true);
-    setLastAction(type); // optimistic update — switch UI instantly
+    pendingActionRef.current = type;
+    setLastAction(type); // optimistic update
     if (!navigator.geolocation) { submitPunchEvent(type, null); return; }
     navigator.geolocation.getCurrentPosition(
       pos => submitPunchEvent(type, { lat: pos.coords.latitude, lng: pos.coords.longitude }),
-      err => { console.warn('Geolocation error:', err.message); submitPunchEvent(type, null); },
-      { timeout: 8000, maximumAge: 60000 }
+      _err => submitPunchEvent(type, null), // non-login: proceed without location
+      { timeout: 8000, maximumAge: 60000, enableHighAccuracy: true }
     );
   };
 
@@ -2562,6 +2850,8 @@ const UserDashboard = () => {
     fetchTasks();
   };
 
+  // Keep ref in sync so idle detection always has latest punch state
+  lastActionRef.current = lastAction;
   const isWorking   = lastAction === 'login' || lastAction === 'break_end' || lastAction === 'lunch_out';
   const isOnBreak   = lastAction === 'break_start';
   const isOnLunch   = lastAction === 'lunch_in';
@@ -2582,7 +2872,7 @@ const UserDashboard = () => {
   const todayLogs = logs.filter(l =>
     isWithinInterval(new Date(l.timestamp), { start: startOfDay(currentTime), end: endOfDay(currentTime) })
   );
-  const { hours: activeH, minutes: activeM, totalMinutes: activeMins } = calculateTotalHours(todayLogs);
+  const { hours: activeH, minutes: activeM, totalMinutes: activeMins, idleDeductedMinutes } = calculateTotalHours(todayLogs);
   const progressPct = Math.min(100, (activeMins / (WORK_SCHEDULE.requiredHours * 60)) * 100);
   const firstPunch  = todayLogs.find(l => l.type === 'login');
 
@@ -2633,20 +2923,42 @@ const UserDashboard = () => {
 
   return (
     <DashboardLayout title="Employee Portal">
+      {/* ── Auto Punch-Out Warning Banner (6:30–6:40 PM) ─────────────────── */}
+      {(() => {
+        const h = currentTime.getHours();
+        const m = currentTime.getMinutes();
+        const minsLeft = 40 - m;
+        const showWarning = h === 18 && m >= 30 && m < 40 && (lastAction === 'login' || lastAction === 'break_end' || lastAction === 'lunch_out');
+        return showWarning ? (
+          <div className="mb-4 bg-amber-50 border-2 border-amber-400 rounded-2xl p-4 flex items-start gap-3">
+            <div className="w-10 h-10 bg-amber-500 rounded-xl flex items-center justify-center shrink-0 animate-pulse">
+              <Clock size={20} className="text-white" />
+            </div>
+            <div className="flex-1">
+              <p className="text-sm font-black text-amber-700">
+                ⚠️ Auto Punch-Out in {minsLeft} minute{minsLeft !== 1 ? 's' : ''}
+              </p>
+              <p className="text-xs text-amber-600 font-semibold mt-1">
+                You will be <strong>automatically punched out at 6:40 PM</strong>. Please save your work and punch out manually if you're done.
+              </p>
+            </div>
+          </div>
+        ) : null;
+      })()}
+
       {/* ── Idle Warning Banner ─────────────────────────────────────────── */}
       {isIdleWarning && (
-        <div className="mb-4 bg-orange-50 border-2 border-orange-300 rounded-2xl p-4 flex items-center gap-3 animate-pulse">
-          <div className="w-10 h-10 bg-orange-500 rounded-xl flex items-center justify-center shrink-0">
+        <div className="mb-4 bg-orange-50 border-2 border-orange-300 rounded-2xl p-4 flex items-start gap-3">
+          <div className="w-10 h-10 bg-orange-500 rounded-xl flex items-center justify-center shrink-0 animate-pulse">
             <Monitor size={20} className="text-white" />
           </div>
           <div className="flex-1">
-            <p className="text-sm font-black text-orange-700">Your system was idle for 15+ minutes</p>
-            <p className="text-xs text-orange-500 font-semibold mt-0.5">Your team lead has been notified. Move your mouse or press any key to resume.</p>
+            <p className="text-sm font-black text-orange-700">⚠️ System idle — time tracking paused</p>
+            <p className="text-xs text-orange-600 font-semibold mt-1">Your system has been idle for <strong>15+ minutes</strong>. Your team lead has been notified.</p>
+            <p className="text-xs text-orange-500 mt-0.5">If idle exceeds <strong>20 minutes</strong>, that time will be <strong>automatically deducted</strong> from your working hours.</p>
+            <p className="text-[10px] text-orange-400 mt-1 font-semibold">👆 Move your mouse or press any key to resume tracking</p>
           </div>
-          <button
-            onClick={() => setIsIdleWarning(false)}
-            className="text-orange-400 hover:text-orange-600 transition-colors"
-          >
+          <button onClick={() => setIsIdleWarning(false)} className="text-orange-400 hover:text-orange-600 transition-colors shrink-0">
             <X size={18} />
           </button>
         </div>
@@ -2698,6 +3010,9 @@ const UserDashboard = () => {
                 <div className="text-center bg-indigo-50 border border-indigo-100 rounded-2xl px-4 py-3 min-w-[80px]">
                   <p className="text-xl font-black text-indigo-700 tabular-nums">{activeH}h {activeM}m</p>
                   <p className="text-[9px] font-black text-indigo-400 uppercase tracking-widest mt-0.5">Active</p>
+                  {idleDeductedMinutes > 0 && (
+                    <p className="text-[8px] font-bold text-orange-500 mt-0.5">-{idleDeductedMinutes}m idle</p>
+                  )}
                 </div>
                 <div className="text-center bg-gray-50 border border-gray-100 rounded-2xl px-4 py-3 min-w-[80px]">
                   <p className="text-xl font-black text-gray-800 tabular-nums">{firstPunch ? format(new Date(firstPunch.timestamp), 'h:mm a') : '--:--'}</p>
@@ -2726,6 +3041,25 @@ const UserDashboard = () => {
                 maxLength={200}
               />
             </div>
+
+            {/* Location error banner */}
+            {locationError && (
+              <div className="mb-4 bg-red-50 border-2 border-red-300 rounded-2xl p-4 flex items-start gap-3">
+                <div className="w-9 h-9 bg-red-500 rounded-xl flex items-center justify-center shrink-0">
+                  <MapPin size={18} className="text-white" />
+                </div>
+                <div className="flex-1">
+                  <p className="text-sm font-black text-red-700">Location Required to Punch In</p>
+                  <p className="text-xs text-red-600 mt-1">{locationError}</p>
+                  <p className="text-[10px] text-red-400 mt-1 font-semibold">
+                    Click the 🔒 lock icon in your browser's address bar → Allow Location → then try again.
+                  </p>
+                </div>
+                <button onClick={() => setLocationError(null)} className="text-red-400 hover:text-red-600 shrink-0">
+                  <X size={16} />
+                </button>
+              </div>
+            )}
 
             {/* Main punch row */}
             <div className="grid grid-cols-2 gap-3 mb-4">
@@ -2966,7 +3300,11 @@ const UserDashboard = () => {
                             </span>
                           )}
                         </div>
-                        {task.description && <p className="text-xs text-gray-500 mb-2 leading-relaxed">{task.description}</p>}
+                        {task.description && (
+                          <pre className="text-[11px] font-mono bg-gray-900 text-green-300 rounded-xl px-3 py-2.5 mb-2 whitespace-pre-wrap break-words max-h-36 overflow-y-auto leading-relaxed border border-gray-700 select-text">
+                            {task.description}
+                          </pre>
+                        )}
                         <div className="flex flex-wrap items-center gap-3 text-[10px] text-gray-400 font-semibold">
                           <span className="flex items-center gap-1">
                             <UserCog size={10} /> Assigned by: {task.assignedByName || 'Team Lead'}
@@ -2982,6 +3320,18 @@ const UserDashboard = () => {
                             </span>
                           )}
                         </div>
+
+                        {/* Submission area */}
+                        {task.submission ? (
+                          <div className="mt-3 bg-emerald-50 border border-emerald-200 rounded-xl p-3">
+                            <p className="text-[10px] font-black text-emerald-600 uppercase tracking-widest mb-1.5 flex items-center gap-1">
+                              ✅ Your Answer — submitted {task.submittedAt ? format(new Date(task.submittedAt), 'MMM d, h:mm a') : ''}
+                            </p>
+                            <pre className="text-[11px] font-mono text-emerald-800 whitespace-pre-wrap break-words leading-relaxed">{task.submission}</pre>
+                          </div>
+                        ) : (
+                          <SubmitAnswerBox taskId={task.id} token={token} onSubmitted={fetchTasks} />
+                        )}
                       </div>
                       {/* Status dropdown */}
                       <div className="shrink-0 flex items-start">
@@ -3040,37 +3390,60 @@ const UserDashboard = () => {
             </div>
           </Card>
 
-          {/* GPS verification — shows actual login location */}
+          {/* GPS tracking — login + latest live location */}
           <Card className="p-5 border border-gray-200">
             <h4 className="text-xs font-black text-gray-400 uppercase tracking-widest mb-3 flex items-center gap-2">
               <MapPin size={13} className="text-indigo-500" />
-              Login Location
+              Location Tracking
             </h4>
             {(() => {
               const loginLog = todayLogs.find(l => l.type === 'login');
-              if (!loginLog?.location) return (
-                <p className="text-xs text-gray-400">Location not captured yet. Enable GPS permissions to track your punch-in location.</p>
+              const latestLocLog = [...todayLogs]
+                .filter(l => (l.type === 'location_update' || l.type === 'login') && l.location)
+                .sort((a, b) => new Date(b.timestamp).getTime() - new Date(a.timestamp).getTime())[0];
+
+              if (!loginLog?.location && !latestLocLog?.location) return (
+                <p className="text-xs text-gray-400">Location not captured yet. Enable GPS permissions in your browser to track your location.</p>
               );
-              const { lat, lng } = loginLog.location;
-              const mapsUrl = `https://www.google.com/maps?q=${lat},${lng}`;
+
+              const loginLoc = loginLog?.location;
+              const latestLoc = latestLocLog?.location;
+              const isLive = latestLocLog?.type === 'location_update';
+
               return (
-                <div>
-                  <p className="text-xs text-gray-600 font-semibold mb-2">
-                    Punched in from:
-                  </p>
-                  <div className="bg-gray-50 border border-gray-200 rounded-xl p-3 mb-3">
-                    <p className="text-[11px] font-bold text-gray-700">📍 {lat.toFixed(5)}, {lng.toFixed(5)}</p>
-                    <p className="text-[10px] text-gray-400 mt-0.5">{loginLog && format(new Date(loginLog.timestamp), 'h:mm a')}</p>
-                  </div>
-                  <a
-                    href={mapsUrl}
-                    target="_blank"
-                    rel="noopener noreferrer"
-                    className="flex items-center gap-2 justify-center w-full py-2 bg-indigo-600 text-white text-xs font-black rounded-xl hover:bg-indigo-700 transition-all"
-                  >
-                    <MapPin size={13} />
-                    View on Google Maps
-                  </a>
+                <div className="space-y-3">
+                  {/* Login location */}
+                  {loginLoc && (
+                    <div>
+                      <p className="text-[10px] font-black text-gray-400 uppercase tracking-widest mb-1.5">Punch-in Location</p>
+                      <div className="bg-gray-50 border border-gray-200 rounded-xl p-3">
+                        <p className="text-[11px] font-bold text-gray-700">📍 {loginLoc.lat.toFixed(5)}, {loginLoc.lng.toFixed(5)}</p>
+                        <p className="text-[10px] text-gray-400 mt-0.5">{loginLog && format(new Date(loginLog.timestamp), 'h:mm a')}</p>
+                      </div>
+                      <a href={`https://www.google.com/maps?q=${loginLoc.lat},${loginLoc.lng}`} target="_blank" rel="noopener noreferrer"
+                        className="mt-1.5 flex items-center gap-1.5 justify-center w-full py-1.5 bg-indigo-50 border border-indigo-100 text-indigo-600 text-[10px] font-black rounded-xl hover:bg-indigo-100 transition-all">
+                        <MapPin size={10} /> View Punch-in on Map
+                      </a>
+                    </div>
+                  )}
+
+                  {/* Latest live location */}
+                  {isLive && latestLoc && (
+                    <div>
+                      <p className="text-[10px] font-black text-emerald-600 uppercase tracking-widest mb-1.5 flex items-center gap-1">
+                        <span className="w-1.5 h-1.5 bg-emerald-500 rounded-full animate-pulse inline-block" />
+                        Live Location · {latestLocLog && format(new Date(latestLocLog.timestamp), 'h:mm a')}
+                      </p>
+                      <div className="bg-emerald-50 border border-emerald-200 rounded-xl p-3">
+                        <p className="text-[11px] font-bold text-emerald-700">📍 {latestLoc.lat.toFixed(5)}, {latestLoc.lng.toFixed(5)}</p>
+                        <p className="text-[10px] text-emerald-500 mt-0.5">Updated every 5 minutes while working</p>
+                      </div>
+                      <a href={`https://www.google.com/maps?q=${latestLoc.lat},${latestLoc.lng}`} target="_blank" rel="noopener noreferrer"
+                        className="mt-1.5 flex items-center gap-1.5 justify-center w-full py-1.5 bg-emerald-600 text-white text-[10px] font-black rounded-xl hover:bg-emerald-700 transition-all">
+                        <MapPin size={10} /> View Live Location on Map
+                      </a>
+                    </div>
+                  )}
                 </div>
               );
             })()}
@@ -3210,7 +3583,13 @@ const TeamLeadDashboard = () => {
     } catch (err) { console.error(err); }
   };
 
-  useEffect(() => { fetchTeamData(); fetchGroups(); }, []);
+  useEffect(() => {
+    fetchTeamData();
+    fetchGroups();
+    // Auto-refresh every 30 seconds so team lead sees live updates without reloading
+    const interval = setInterval(fetchTeamData, 30_000);
+    return () => clearInterval(interval);
+  }, []);
 
   const todayStr = format(currentTime, 'yyyy-MM-dd');
   const todayLogs = teamData.logs.filter(l => l.timestamp.startsWith(todayStr));
@@ -3219,13 +3598,18 @@ const TeamLeadDashboard = () => {
     const uLogs = [...todayLogs.filter(l => l.userId === uid)].sort(
       (a, b) => new Date(a.timestamp).getTime() - new Date(b.timestamp).getTime()
     );
-    const last = [...uLogs].reverse().find(l => l.type !== 'daily_report');
+    // Skip idle and daily_report events — they don't change work status
+    const last = [...uLogs].reverse().find(l =>
+      l.type !== 'daily_report' &&
+      l.type !== 'idle_start' &&
+      l.type !== 'idle_end' &&
+      l.type !== 'location_update'
+    );
     if (!last) return 'Absent';
-    if (last.type === 'login' || last.type === 'break_end') return 'Working';
+    if (last.type === 'login' || last.type === 'break_end' || last.type === 'lunch_out') return 'Working';
     if (last.type === 'break_start') return 'On Break';
     if (last.type === 'lunch_in')  return 'On Lunch';
     if (last.type === 'logout')    return 'Left';
-    if (last.type === 'lunch_out') return 'Working';
     return 'Absent';
   };
 
@@ -3280,14 +3664,31 @@ const TeamLeadDashboard = () => {
 
   const lateCount = lateArrivals.length;
 
-  // Idle detection for team lead: employee's last non-daily_report log today is idle_start
+  // Idle detection for team lead: only idle if last idle_start has no idle_end after it
+  // AND the employee is currently supposed to be working (punched in)
   const getIdleInfo = (uid: string): { isIdle: boolean; idleSince: Date | null } => {
     const uLogs = todayLogs
-      .filter(l => l.userId === uid && l.type !== 'daily_report')
+      .filter(l => l.userId === uid && l.type !== 'daily_report' && l.type !== 'location_update')
       .sort((a, b) => new Date(a.timestamp).getTime() - new Date(b.timestamp).getTime());
     if (uLogs.length === 0) return { isIdle: false, idleSince: null };
     const last = uLogs[uLogs.length - 1];
-    if (last.type === 'idle_start') return { isIdle: true, idleSince: new Date(last.timestamp) };
+    // Only mark idle if the very last event is idle_start (meaning no idle_end came after)
+    // AND the employee is working (not on break/lunch/logged out)
+    if (last.type !== 'idle_start') return { isIdle: false, idleSince: null };
+    // Check if they were working before going idle
+    const workLog = [...uLogs].reverse().find(l =>
+      l.type === 'login' || l.type === 'break_end' || l.type === 'lunch_out' || l.type === 'idle_start'
+    );
+    if (!workLog || workLog.type === 'idle_start') {
+      // Only idle if the last meaningful work event was indeed before idle_start
+      const idleLog = last;
+      const beforeIdle = [...uLogs].reverse().find(l =>
+        new Date(l.timestamp) < new Date(idleLog.timestamp) &&
+        (l.type === 'login' || l.type === 'break_end' || l.type === 'lunch_out')
+      );
+      if (!beforeIdle) return { isIdle: false, idleSince: null };
+      return { isIdle: true, idleSince: new Date(last.timestamp) };
+    }
     return { isIdle: false, idleSince: null };
   };
 
@@ -3317,7 +3718,13 @@ const TeamLeadDashboard = () => {
       <div className="flex flex-col sm:flex-row sm:items-center gap-3 mb-6">
         <div>
           <h2 className="text-2xl font-black text-gray-900">Team Monitor</h2>
-          <p className="text-xs text-gray-400 font-semibold mt-0.5">{format(currentTime, 'EEEE, MMMM d, yyyy')} · {format(currentTime, 'h:mm a')}</p>
+          <p className="text-xs text-gray-400 font-semibold mt-0.5 flex items-center gap-2">
+            {format(currentTime, 'EEEE, MMMM d, yyyy')} · {format(currentTime, 'h:mm a')}
+            <span className="inline-flex items-center gap-1 text-emerald-500">
+              <span className="w-1.5 h-1.5 bg-emerald-500 rounded-full animate-pulse inline-block" />
+              Live · refreshes every 30s
+            </span>
+          </p>
         </div>
         <div className="sm:ml-auto flex items-center gap-2 flex-wrap">
           <div className="relative">
@@ -3458,6 +3865,95 @@ const TeamLeadDashboard = () => {
         </div>
       )}
 
+      {/* ── Auto Punch-Out Alert (team lead view) ───────────────────────── */}
+      {activeTab === 'members' && (() => {
+        // Employees still punched in after 6:30 PM (approaching auto punch-out)
+        const h = currentTime.getHours();
+        const m = currentTime.getMinutes();
+        const isApproaching = h === 18 && m >= 30 && m < 40;
+        const isPastCutoff  = h > 18 || (h === 18 && m >= 40);
+
+        // Auto-punched-out: logout logs with the auto note
+        const autoPunchedOut = teamData.users.filter(u => {
+          return todayLogs.some(l =>
+            l.userId === u.id &&
+            l.type   === 'logout' &&
+            l.note   === 'Auto punch-out at 6:40 PM'
+          );
+        });
+
+        // Still punched in after 6:30 PM warning threshold
+        const stillInAfterWarning = isApproaching
+          ? teamData.users.filter(u => {
+              const s = getMemberStatus(u.id);
+              return s === 'Working' || s === 'On Break' || s === 'On Lunch';
+            })
+          : [];
+
+        if (isApproaching && stillInAfterWarning.length > 0) {
+          return (
+            <div className="mb-6 bg-amber-50 border-2 border-amber-400 rounded-2xl p-4">
+              <div className="flex items-center gap-2 mb-3">
+                <div className="w-7 h-7 bg-amber-500 rounded-xl flex items-center justify-center shrink-0 animate-pulse">
+                  <Clock size={14} className="text-white" />
+                </div>
+                <div>
+                  <p className="text-sm font-black text-amber-700">
+                    {stillInAfterWarning.length} Employee{stillInAfterWarning.length > 1 ? 's' : ''} — Auto Punch-Out in {40 - m} min{40 - m !== 1 ? 's' : ''}
+                  </p>
+                  <p className="text-[10px] text-amber-500 font-semibold">These employees will be automatically punched out at 6:40 PM</p>
+                </div>
+              </div>
+              <div className="flex flex-wrap gap-2">
+                {stillInAfterWarning.map(u => (
+                  <button key={u.id} onClick={() => setSelectedMember(u)}
+                    className="flex items-center gap-2 bg-white border border-amber-200 rounded-xl px-3 py-2 hover:bg-amber-50 hover:border-amber-300 transition-all group">
+                    <div className={`w-7 h-7 rounded-lg bg-amber-400 text-white flex items-center justify-center text-xs font-black shrink-0`}>
+                      {u.name.charAt(0).toUpperCase()}
+                    </div>
+                    <p className="text-xs font-black text-gray-900 group-hover:text-amber-700 transition-colors">{u.name}</p>
+                  </button>
+                ))}
+              </div>
+            </div>
+          );
+        }
+
+        if (autoPunchedOut.length > 0) {
+          return (
+            <div className="mb-6 bg-indigo-50 border-2 border-indigo-200 rounded-2xl p-4">
+              <div className="flex items-center gap-2 mb-3">
+                <div className="w-7 h-7 bg-indigo-500 rounded-xl flex items-center justify-center shrink-0">
+                  <Clock size={14} className="text-white" />
+                </div>
+                <div>
+                  <p className="text-sm font-black text-indigo-700">
+                    {autoPunchedOut.length} Employee{autoPunchedOut.length > 1 ? 's' : ''} Auto Punched Out at 6:40 PM
+                  </p>
+                  <p className="text-[10px] text-indigo-400 font-semibold">These employees did not punch out manually — system logged them out automatically.</p>
+                </div>
+              </div>
+              <div className="flex flex-wrap gap-2">
+                {autoPunchedOut.map(u => (
+                  <button key={u.id} onClick={() => setSelectedMember(u)}
+                    className="flex items-center gap-2 bg-white border border-indigo-200 rounded-xl px-3 py-2 hover:bg-indigo-50 hover:border-indigo-300 transition-all group">
+                    <div className={`w-7 h-7 rounded-lg bg-indigo-400 text-white flex items-center justify-center text-xs font-black shrink-0`}>
+                      {u.name.charAt(0).toUpperCase()}
+                    </div>
+                    <div className="text-left">
+                      <p className="text-xs font-black text-gray-900 group-hover:text-indigo-700 transition-colors">{u.name}</p>
+                      <p className="text-[10px] font-semibold text-indigo-400">Auto logged out · 6:40 PM</p>
+                    </div>
+                  </button>
+                ))}
+              </div>
+            </div>
+          );
+        }
+
+        return null;
+      })()}
+
       {activeTab === 'groups' ? (
         /* ── Groups Panel ───────────────────────────────────────────── */
         <div>
@@ -3590,6 +4086,12 @@ const TeamLeadDashboard = () => {
               const productivity = Math.min(100, Math.round(((hours * 60 + minutes) / 480) * 100));
               const punchIn    = uTodayLogs.find(l => l.type === 'login');
               const myTasks    = tasks.filter(t => t.assignedTo === u.id && t.status !== 'completed');
+              // Latest location: prefer most recent location_update, fallback to login location
+              const latestLocLog = [...uTodayLogs]
+                .filter(l => (l.type === 'location_update' || l.type === 'login' || l.type === 'logout') && l.location)
+                .sort((a, b) => new Date(b.timestamp).getTime() - new Date(a.timestamp).getTime())[0];
+              const latestLocation = latestLocLog?.location ?? null;
+              const latestLocTime  = latestLocLog ? new Date(latestLocLog.timestamp) : null;
               const initials   = u.name.split(' ').map((n: string) => n[0]).join('').toUpperCase().slice(0, 2);
               const { isLate, minsLate } = getLateInfo(u.id);
               const { isIdle, idleSince } = getIdleInfo(u.id);
@@ -3689,17 +4191,24 @@ const TeamLeadDashboard = () => {
                       <p className="text-[9px] text-gray-400 font-semibold uppercase tracking-wide">Punch In</p>
                     </div>
                   </div>
-                  {/* Location link */}
-                  {punchIn?.location && (
+                  {/* Location link — shows latest tracked location */}
+                  {latestLocation && (
                     <a
-                      href={`https://www.google.com/maps?q=${punchIn.location.lat},${punchIn.location.lng}`}
+                      href={`https://www.google.com/maps?q=${latestLocation.lat},${latestLocation.lng}`}
                       target="_blank"
                       rel="noopener noreferrer"
                       onClick={e => e.stopPropagation()}
-                      className="mt-3 flex items-center justify-center gap-1.5 w-full py-1.5 bg-indigo-50 border border-indigo-100 text-indigo-600 text-[10px] font-black rounded-xl hover:bg-indigo-100 transition-all"
+                      className="mt-3 flex items-center justify-between gap-1.5 w-full px-3 py-2 bg-emerald-50 border border-emerald-200 text-emerald-700 text-[10px] font-black rounded-xl hover:bg-emerald-100 transition-all"
                     >
-                      <MapPin size={10} />
-                      View Login Location
+                      <span className="flex items-center gap-1.5">
+                        <MapPin size={10} className="animate-pulse" />
+                        📍 Live Location
+                      </span>
+                      {latestLocTime && (
+                        <span className="text-emerald-500 font-semibold">
+                          {format(latestLocTime, 'h:mm a')}
+                        </span>
+                      )}
                     </a>
                   )}
                 </motion.div>
@@ -3766,35 +4275,61 @@ const TeamLeadDashboard = () => {
                 completed: 'text-emerald-700 bg-emerald-100',
               };
               return (
-                <div key={task.id} className={`flex items-center gap-4 px-5 py-3.5 hover:bg-gray-50/70 transition-all group ${task.status === 'completed' ? 'opacity-60' : ''}`}>
-                  <div className={`w-1 h-10 rounded-full shrink-0 ${task.priority === 'urgent' ? 'bg-rose-500' : task.priority === 'high' ? 'bg-orange-400' : task.priority === 'medium' ? 'bg-amber-400' : 'bg-sky-400'}`} />
-                  <div className="flex-1 min-w-0">
-                    <p className={`text-sm font-black truncate ${task.status === 'completed' ? 'line-through text-gray-400' : 'text-gray-900'}`}>{task.title}</p>
-                    <div className="flex items-center gap-2 mt-0.5 flex-wrap">
-                      <span className={`text-[9px] font-black px-1.5 py-0.5 rounded border uppercase ${PCOL[task.priority] || PCOL.medium}`}>{task.priority}</span>
-                      {isOverdue && <span className="text-[9px] font-black px-1.5 py-0.5 rounded border uppercase text-rose-600 bg-rose-50 border-rose-100">Overdue</span>}
-                      <span className="text-[10px] text-gray-400 font-semibold flex items-center gap-1">
-                        <User size={9} /> {assignee?.name || 'Unknown'}
-                      </span>
-                      {task.groupName && (
-                        <span className="text-[9px] font-black px-1.5 py-0.5 rounded border bg-indigo-50 text-indigo-600 border-indigo-100 flex items-center gap-0.5">
-                          🗂️ {task.groupName}
+                <div key={task.id} className={`flex flex-col gap-0 px-5 py-3.5 hover:bg-gray-50/70 transition-all group border-b border-gray-50 last:border-0 ${task.status === 'completed' ? 'opacity-60' : ''}`}>
+                  <div className="flex items-center gap-4">
+                    <div className={`w-1 h-10 rounded-full shrink-0 ${task.priority === 'urgent' ? 'bg-rose-500' : task.priority === 'high' ? 'bg-orange-400' : task.priority === 'medium' ? 'bg-amber-400' : 'bg-sky-400'}`} />
+                    <div className="flex-1 min-w-0">
+                      <p className={`text-sm font-black truncate ${task.status === 'completed' ? 'line-through text-gray-400' : 'text-gray-900'}`}>{task.title}</p>
+                      <div className="flex items-center gap-2 mt-0.5 flex-wrap">
+                        <span className={`text-[9px] font-black px-1.5 py-0.5 rounded border uppercase ${PCOL[task.priority] || PCOL.medium}`}>{task.priority}</span>
+                        {isOverdue && <span className="text-[9px] font-black px-1.5 py-0.5 rounded border uppercase text-rose-600 bg-rose-50 border-rose-100">Overdue</span>}
+                        <span className="text-[10px] text-gray-400 font-semibold flex items-center gap-1">
+                          <User size={9} /> {assignee?.name || 'Unknown'}
                         </span>
-                      )}
-                      {task.dueDate && <span className="text-[10px] text-gray-400 font-semibold flex items-center gap-1"><Calendar size={9} /> {format(new Date(task.dueDate), 'MMM d')}</span>}
+                        {task.groupName && (
+                          <span className="text-[9px] font-black px-1.5 py-0.5 rounded border bg-indigo-50 text-indigo-600 border-indigo-100 flex items-center gap-0.5">
+                            🗂️ {task.groupName}
+                          </span>
+                        )}
+                        {task.dueDate && <span className="text-[10px] text-gray-400 font-semibold flex items-center gap-1"><Calendar size={9} /> {format(new Date(task.dueDate), 'MMM d')}</span>}
+                        {task.description && (
+                          <span className="text-[9px] font-semibold text-gray-400 flex items-center gap-0.5">
+                            <FileText size={9} /> has notes
+                          </span>
+                        )}
+                      </div>
+                    </div>
+                    <span className={`text-[10px] font-black px-2.5 py-1 rounded-full capitalize shrink-0 ${SCOL[task.status] || SCOL.pending}`}>{task.status.replace('_', ' ')}</span>
+                    <div className="flex gap-1 opacity-0 group-hover:opacity-100 transition-opacity shrink-0">
+                      <button onClick={() => { setEditTask(task); setIsTaskModalOpen(true); }}
+                        className="p-1.5 rounded-lg hover:bg-indigo-50 text-gray-400 hover:text-indigo-600 transition-all border border-transparent hover:border-indigo-100">
+                        <Edit2 size={13} />
+                      </button>
+                      <button onClick={() => deleteTask(task.id)}
+                        className="p-1.5 rounded-lg hover:bg-rose-50 text-gray-400 hover:text-rose-500 transition-all border border-transparent hover:border-rose-100">
+                        <Trash2 size={13} />
+                      </button>
                     </div>
                   </div>
-                  <span className={`text-[10px] font-black px-2.5 py-1 rounded-full capitalize shrink-0 ${SCOL[task.status] || SCOL.pending}`}>{task.status.replace('_', ' ')}</span>
-                  <div className="flex gap-1 opacity-0 group-hover:opacity-100 transition-opacity shrink-0">
-                    <button onClick={() => { setEditTask(task); setIsTaskModalOpen(true); }}
-                      className="p-1.5 rounded-lg hover:bg-indigo-50 text-gray-400 hover:text-indigo-600 transition-all border border-transparent hover:border-indigo-100">
-                      <Edit2 size={13} />
-                    </button>
-                    <button onClick={() => deleteTask(task.id)}
-                      className="p-1.5 rounded-lg hover:bg-rose-50 text-gray-400 hover:text-rose-500 transition-all border border-transparent hover:border-rose-100">
-                      <Trash2 size={13} />
-                    </button>
-                  </div>
+                  {/* Notes / Code pad preview */}
+                  {task.description && (
+                    <div className="ml-5 mt-2">
+                      <pre className="bg-gray-900 text-green-300 text-[11px] font-mono rounded-xl px-4 py-3 whitespace-pre-wrap break-words max-h-40 overflow-y-auto leading-relaxed border border-gray-700 select-text">
+                        {task.description}
+                      </pre>
+                    </div>
+                  )}
+                  {/* Employee submission */}
+                  {task.submission && (
+                    <div className="ml-5 mt-2 mb-1">
+                      <p className="text-[9px] font-black text-emerald-600 uppercase tracking-widest mb-1 flex items-center gap-1">
+                        ✅ Employee Answer · {task.submittedAt ? format(new Date(task.submittedAt), 'MMM d, h:mm a') : ''}
+                      </p>
+                      <pre className="bg-emerald-950 text-emerald-300 text-[11px] font-mono rounded-xl px-4 py-3 whitespace-pre-wrap break-words max-h-40 overflow-y-auto leading-relaxed border border-emerald-800 select-text">
+                        {task.submission}
+                      </pre>
+                    </div>
+                  )}
                 </div>
               );
             })}
@@ -4271,7 +4806,7 @@ const TaskModal = ({
             className="absolute inset-0 bg-black/60 backdrop-blur-sm" onClick={onClose} />
           <motion.div initial={{ opacity: 0, scale: 0.95, y: 20 }} animate={{ opacity: 1, scale: 1, y: 0 }}
             exit={{ opacity: 0, scale: 0.95, y: 20 }}
-            className="bg-white w-full max-w-lg rounded-3xl shadow-2xl relative overflow-hidden z-10">
+            className="bg-white w-full max-w-lg rounded-3xl shadow-2xl relative z-10 flex flex-col max-h-[90vh]">
 
             {/* Header */}
             <div className="p-6 border-b border-gray-100 bg-indigo-50/40 flex items-center justify-between">
@@ -4289,7 +4824,8 @@ const TaskModal = ({
               </button>
             </div>
 
-            <form onSubmit={handleSubmit} className="p-6 space-y-5">
+            <form onSubmit={handleSubmit} className="flex flex-col flex-1 overflow-hidden">
+              <div className="flex-1 overflow-y-auto p-6 space-y-5">
               {error && (
                 <div className="p-3 bg-red-50 border border-red-100 text-red-600 text-xs font-bold rounded-xl flex items-center gap-2">
                   <AlertCircle size={14} /> {error}
@@ -4306,14 +4842,32 @@ const TaskModal = ({
                 />
               </div>
 
-              {/* Description */}
+              {/* Description / Notepad */}
               <div className="space-y-1.5">
-                <label className="text-[10px] font-black text-gray-400 uppercase tracking-widest pl-1">Description</label>
+                <label className="text-[10px] font-black text-gray-400 uppercase tracking-widest pl-1 flex items-center gap-1.5">
+                  <FileText size={11} /> Notes / Code Pad
+                  <span className="text-gray-300 font-normal normal-case tracking-normal">— paste instructions, code snippets, links</span>
+                </label>
                 <textarea
-                  rows={2} placeholder="Task details, context, or expectations..."
-                  className="w-full px-4 py-3 bg-gray-50 border border-gray-200 rounded-xl text-sm focus:ring-2 focus:ring-indigo-500 outline-none focus:bg-white transition-all resize-none"
-                  value={form.description} onChange={e => setForm({ ...form, description: e.target.value })}
+                  rows={6}
+                  placeholder={"Write task details, paste code, add links...\n\nExample:\n  function hello() {\n    console.log('Hello World');\n  }"}
+                  className="w-full px-4 py-3 bg-gray-900 border border-gray-700 rounded-xl text-sm focus:ring-2 focus:ring-indigo-500 outline-none focus:bg-gray-800 transition-all resize-y font-mono text-green-300 placeholder-gray-600 leading-relaxed"
+                  value={form.description}
+                  onChange={e => setForm({ ...form, description: e.target.value })}
+                  onKeyDown={e => {
+                    // Support Tab key for indentation
+                    if (e.key === 'Tab') {
+                      e.preventDefault();
+                      const el = e.currentTarget;
+                      const start = el.selectionStart;
+                      const end = el.selectionEnd;
+                      const newVal = el.value.substring(0, start) + '  ' + el.value.substring(end);
+                      setForm({ ...form, description: newVal });
+                      setTimeout(() => { el.selectionStart = el.selectionEnd = start + 2; }, 0);
+                    }
+                  }}
                 />
+                <p className="text-[9px] text-gray-400 pl-1">Press Tab to indent · Drag bottom-right corner to resize</p>
               </div>
 
               {/* Assign mode toggle — only for new tasks */}
@@ -4437,8 +4991,10 @@ const TaskModal = ({
                 </div>
               </div>
 
-              {/* Actions */}
-              <div className="flex gap-3 pt-2">
+              </div> {/* end scrollable area */}
+
+              {/* Actions — fixed at bottom */}
+              <div className="flex gap-3 p-6 pt-4 border-t border-gray-100 bg-white">
                 <button type="button" onClick={onClose}
                   className="flex-1 py-3 rounded-xl border border-gray-200 text-sm font-black text-gray-600 hover:bg-gray-50 transition-all">
                   Cancel
@@ -4532,7 +5088,7 @@ const AdminDashboard = () => {
 
   useEffect(() => {
     fetchData();
-    const interval = setInterval(fetchData, 10000);
+    const interval = setInterval(fetchData, 30_000);
     return () => clearInterval(interval);
   }, [token]);
 

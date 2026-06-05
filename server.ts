@@ -15,6 +15,7 @@ import {
   taskQueries,
   groupQueries,
   groupMemberQueries,
+  notificationQueries,
   safeUser,
   formatLog,
   formatTask,
@@ -96,13 +97,46 @@ app.get('/api/logs', requireAuth, (req: AuthRequest, res: Response): void => {
 
 app.post('/api/logs', requireAuth, (req: AuthRequest, res: Response): void => {
   const { type, note, location } = req.body;
-  const valid = ['login','logout','lunch_in','lunch_out','break_start','break_end','daily_report','idle_start','idle_end'];
+  const valid = ['login','logout','lunch_in','lunch_out','break_start','break_end','daily_report','idle_start','idle_end','location_update'];
   if (!valid.includes(type)) { res.status(400).json({ error: `Invalid log type: ${type}` }); return; }
+
+  const userId = req.user!.id;
+  const todayStr = new Date().toISOString().slice(0, 10);
+
+  // ── Duplicate prevention ──────────────────────────────────────────────────
+  // Get today's logs for this user, sorted ascending
+  const allUserLogs = logQueries.forUser(userId)
+    .filter(l => l.timestamp.startsWith(todayStr))
+    .sort((a, b) => new Date(a.timestamp).getTime() - new Date(b.timestamp).getTime());
+
+  // Last meaningful log (ignoring idle and location updates)
+  const lastMeaningful = [...allUserLogs]
+    .reverse()
+    .find(l => !['idle_start','idle_end','location_update','daily_report'].includes(l.type));
+
+  const lastType = lastMeaningful?.type ?? null;
+
+  // Prevent duplicate consecutive events
+  if (type === 'login'       && lastType === 'login')       { res.status(409).json({ error: 'Already punched in' }); return; }
+  if (type === 'logout'      && lastType === 'logout')      { res.status(409).json({ error: 'Already punched out' }); return; }
+  if (type === 'logout'      && !lastType)                  { res.status(409).json({ error: 'Not punched in yet' }); return; }
+  if (type === 'break_start' && lastType === 'break_start') { res.status(409).json({ error: 'Already on break — finish current break first' }); return; }
+  if (type === 'break_end'   && lastType !== 'break_start') { res.status(409).json({ error: 'No active break to finish' }); return; }
+  if (type === 'lunch_in'    && lastType === 'lunch_in')    { res.status(409).json({ error: 'Already on lunch break' }); return; }
+  if (type === 'lunch_out'   && lastType !== 'lunch_in')    { res.status(409).json({ error: 'No active lunch break to finish' }); return; }
+
+  // Prevent break_start if not currently working
+  if (type === 'break_start') {
+    const validBeforeBreak = ['login', 'break_end', 'lunch_out'];
+    if (!lastType || !validBeforeBreak.includes(lastType)) {
+      res.status(409).json({ error: 'Must be punched in to start a break' }); return;
+    }
+  }
 
   const id = randomUUID();
   const ts = new Date().toISOString();
-  logQueries.insert(id, req.user!.id, type, ts, note ?? null, location?.lat ?? null, location?.lng ?? null);
-  res.json(formatLog({ id, userId: req.user!.id, type, timestamp: ts, note: note ?? null, lat: location?.lat ?? null, lng: location?.lng ?? null }));
+  logQueries.insert(id, userId, type, ts, note ?? null, location?.lat ?? null, location?.lng ?? null);
+  res.json(formatLog({ id, userId, type, timestamp: ts, note: note ?? null, lat: location?.lat ?? null, lng: location?.lng ?? null }));
 });
 
 // ─── Admin routes ─────────────────────────────────────────────────────────────
@@ -294,6 +328,19 @@ app.delete('/api/tasks/:id', requireAuth, requireTeamLead, (req: AuthRequest, re
   res.json({ success: true });
 });
 
+// ─── Task submission (employee posts answer) ──────────────────────────────────
+app.post('/api/tasks/:id/submit', requireAuth, (req: AuthRequest, res: Response): void => {
+  const { id } = req.params;
+  const { submission } = req.body;
+  if (!submission?.trim()) { res.status(400).json({ error: 'Submission cannot be empty' }); return; }
+  const task = taskQueries.findById(id);
+  if (!task) { res.status(404).json({ error: 'Task not found' }); return; }
+  if (task.assignedTo !== req.user!.id) { res.status(403).json({ error: 'This task is not assigned to you' }); return; }
+  const now = new Date().toISOString();
+  taskQueries.submit(submission.trim(), now, 'completed', now, id);
+  res.json(formatTask({ ...task, submission: submission.trim(), submittedAt: now, status: 'completed', updatedAt: now }));
+});
+
 // ─── Group routes ─────────────────────────────────────────────────────────────
 
 function formatGroup(g: import('./db.js').DBGroup & { memberIds?: string[] }) {
@@ -387,6 +434,130 @@ app.delete('/api/groups/:id/members/:userId', requireAuth, requireTeamLead, (req
   groupMemberQueries.remove(id, userId);
   res.json(formatGroup(groupQueries.findById(id)!));
 });
+
+// ─── Notification routes ──────────────────────────────────────────────────────
+
+app.get('/api/notifications', requireAuth, (req: AuthRequest, res: Response): void => {
+  const notifs = notificationQueries.forUser(req.user!.id);
+  res.json(notifs.map(n => ({
+    ...n,
+    isRead:   n.isRead === 1,
+    metadata: n.metadata ? JSON.parse(n.metadata) : null,
+  })));
+});
+
+app.put('/api/notifications/read', requireAuth, (req: AuthRequest, res: Response): void => {
+  notificationQueries.markAllRead(req.user!.id);
+  res.json({ success: true });
+});
+
+app.put('/api/notifications/:id/read', requireAuth, (req: AuthRequest, res: Response): void => {
+  notificationQueries.markRead(req.params.id);
+  res.json({ success: true });
+});
+
+// ─── Auto punch-out scheduler ─────────────────────────────────────────────────
+// Warning notification at 6:30 PM, auto punch-out at 6:40 PM every day.
+
+function getUsersStillPunchedIn(): Array<{ id: string; name: string }> {
+  const todayStr = new Date().toISOString().slice(0, 10);
+  const allUsers = userQueries.findByRole('user').filter(u => u.status === 'active');
+  const todayLogs = logQueries.allOnDate(todayStr);
+
+  return allUsers.filter(u => {
+    const uLogs = todayLogs
+      .filter(l => l.userId === u.id &&
+        !['idle_start', 'idle_end', 'location_update', 'daily_report'].includes(l.type))
+      .sort((a, b) => new Date(a.timestamp).getTime() - new Date(b.timestamp).getTime());
+    if (uLogs.length === 0) return false;
+    return uLogs[uLogs.length - 1].type !== 'logout';
+  }).map(u => ({ id: u.id, name: u.name }));
+}
+
+setInterval(() => {
+  const now = new Date();
+  const h   = now.getHours();
+  const m   = now.getMinutes();
+  const ts  = now.toISOString();
+  const sinceTs = new Date(now.getTime() - 90_000).toISOString(); // last 90 s dedup window
+
+  // ── 6:30 PM — warning notification ──────────────────────────────────────────
+  if (h === 18 && m === 30) {
+    const stillIn    = getUsersStillPunchedIn();
+    const recipients = [
+      ...userQueries.findByRole('teamlead'),
+      ...userQueries.findByRole('admin'),
+    ];
+
+    // Notify each employee still punched in
+    for (const emp of stillIn) {
+      if (!notificationQueries.existsSince(emp.id, 'auto_punchout_warning', sinceTs)) {
+        notificationQueries.insert(
+          randomUUID(), emp.id,
+          'auto_punchout_warning',
+          '⚠️ Auto Punch-Out in 10 Minutes',
+          'You will be automatically punched out at 6:40 PM. Please save your work.',
+          ts, null,
+        );
+      }
+    }
+
+    // Notify team leads / admins
+    if (stillIn.length > 0) {
+      for (const lead of recipients) {
+        if (!notificationQueries.existsSince(lead.id, 'auto_punchout_warning_lead', sinceTs)) {
+          notificationQueries.insert(
+            randomUUID(), lead.id,
+            'auto_punchout_warning_lead',
+            '⚠️ Auto Punch-Out Warning',
+            `${stillIn.length} employee${stillIn.length > 1 ? 's' : ''} still punched in — auto punch-out at 6:40 PM.`,
+            ts, JSON.stringify({ count: stillIn.length, names: stillIn.map(e => e.name) }),
+          );
+        }
+      }
+    }
+    console.log(`[AutoPunchOut] 6:30 PM warning sent to ${stillIn.length} employee(s).`);
+  }
+
+  // ── 6:40 PM — auto punch-out ─────────────────────────────────────────────────
+  if (h === 18 && m === 40) {
+    const stillIn    = getUsersStillPunchedIn();
+    const recipients = [
+      ...userQueries.findByRole('teamlead'),
+      ...userQueries.findByRole('admin'),
+    ];
+
+    for (const emp of stillIn) {
+      if (notificationQueries.existsSince(emp.id, 'auto_punchout', sinceTs)) continue;
+      // Insert auto logout log
+      logQueries.insert(randomUUID(), emp.id, 'logout', ts, 'Auto punch-out at 6:40 PM', null, null);
+      // Notify employee
+      notificationQueries.insert(
+        randomUUID(), emp.id,
+        'auto_punchout',
+        '🕔 Automatically Punched Out',
+        'You were automatically punched out at 6:40 PM because you did not punch out manually.',
+        ts, null,
+      );
+    }
+
+    // Summary notification to team leads / admins
+    if (stillIn.length > 0) {
+      for (const lead of recipients) {
+        if (!notificationQueries.existsSince(lead.id, 'auto_punchout_summary', sinceTs)) {
+          notificationQueries.insert(
+            randomUUID(), lead.id,
+            'auto_punchout_summary',
+            '🕔 Auto Punch-Out Complete',
+            `${stillIn.length} employee${stillIn.length > 1 ? 's were' : ' was'} automatically punched out at 6:40 PM: ${stillIn.map(e => e.name).join(', ')}.`,
+            ts, JSON.stringify({ count: stillIn.length, names: stillIn.map(e => e.name) }),
+          );
+        }
+      }
+    }
+    console.log(`[AutoPunchOut] 6:40 PM — auto punched out ${stillIn.length} employee(s).`);
+  }
+}, 60_000); // runs every minute
 
 // ─── Serve Vite build ─────────────────────────────────────────────────────────
 

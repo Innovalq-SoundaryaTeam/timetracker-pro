@@ -88,11 +88,29 @@ db.exec(`
   );
 
   CREATE INDEX IF NOT EXISTS idx_logs_userId    ON time_logs(userId);
+
+  CREATE TABLE IF NOT EXISTS notifications (
+    id        TEXT PRIMARY KEY,
+    userId    TEXT NOT NULL,
+    type      TEXT NOT NULL,
+    title     TEXT NOT NULL,
+    message   TEXT NOT NULL,
+    timestamp TEXT NOT NULL,
+    isRead    INTEGER NOT NULL DEFAULT 0,
+    metadata  TEXT,
+    FOREIGN KEY (userId) REFERENCES users(id) ON DELETE CASCADE
+  );
+
+  CREATE INDEX IF NOT EXISTS idx_notif_userId ON notifications(userId);
+  CREATE INDEX IF NOT EXISTS idx_notif_ts     ON notifications(timestamp);
 `);
 
 // Add groupId / groupName columns if they don't exist yet (safe migration)
-try { db.exec("ALTER TABLE tasks ADD COLUMN groupId   TEXT"); } catch (_) {}
-try { db.exec("ALTER TABLE tasks ADD COLUMN groupName TEXT"); } catch (_) {}
+try { db.exec("ALTER TABLE tasks ADD COLUMN groupId      TEXT"); } catch (_) {}
+try { db.exec("ALTER TABLE tasks ADD COLUMN groupName    TEXT"); } catch (_) {}
+// Add submission columns for employee answers
+try { db.exec("ALTER TABLE tasks ADD COLUMN submission   TEXT"); } catch (_) {}
+try { db.exec("ALTER TABLE tasks ADD COLUMN submittedAt  TEXT"); } catch (_) {}
 
 db.exec(`
   CREATE INDEX IF NOT EXISTS idx_logs_timestamp ON time_logs(timestamp);
@@ -156,6 +174,8 @@ export interface DBTask {
   updatedAt: string | null;
   groupId: string | null;
   groupName: string | null;
+  submission: string | null;
+  submittedAt: string | null;
 }
 
 // ─── Helper: typed get / all wrappers ────────────────────────────────────────
@@ -233,6 +253,7 @@ const _tUpdateFull   = db.prepare(
    WHERE id=?`
 );
 const _tDelete       = db.prepare('DELETE FROM tasks WHERE id=?');
+const _tSubmit       = db.prepare('UPDATE tasks SET submission=?,submittedAt=?,status=?,updatedAt=? WHERE id=?');
 
 export const taskQueries = {
   all:          ()               => getAll<DBTask>(_tAll),
@@ -243,6 +264,8 @@ export const taskQueries = {
   updateStatus: (...a: unknown[])=> _tUpdateStatus.run(...a),
   updateFull:   (...a: unknown[])=> _tUpdateFull.run(...a),
   delete:       (id: string)     => _tDelete.run(id),
+  submit:       (submission: string, submittedAt: string, status: string, updatedAt: string, id: string) =>
+                  _tSubmit.run(submission, submittedAt, status, updatedAt, id),
 };
 
 // ─── Group queries ────────────────────────────────────────────────────────────
@@ -329,7 +352,39 @@ export function formatTask(t: DBTask) {
     updatedAt:      t.updatedAt      ?? undefined,
     groupId:        t.groupId        ?? null,
     groupName:      t.groupName      ?? null,
+    submission:     t.submission     ?? null,
+    submittedAt:    t.submittedAt    ?? null,
   };
 }
+
+// ─── Notification queries ─────────────────────────────────────────────────────
+
+export interface DBNotification {
+  id:        string;
+  userId:    string;
+  type:      string;
+  title:     string;
+  message:   string;
+  timestamp: string;
+  isRead:    number;
+  metadata:  string | null;
+}
+
+const _nInsert      = db.prepare('INSERT INTO notifications (id,userId,type,title,message,timestamp,isRead,metadata) VALUES (?,?,?,?,?,?,0,?)');
+const _nForUser     = db.prepare('SELECT * FROM notifications WHERE userId=? ORDER BY timestamp DESC LIMIT 50');
+const _nMarkRead    = db.prepare('UPDATE notifications SET isRead=1 WHERE id=?');
+const _nMarkAllRead = db.prepare('UPDATE notifications SET isRead=1 WHERE userId=?');
+const _nCountSince  = db.prepare('SELECT COUNT(*) as c FROM notifications WHERE userId=? AND type=? AND timestamp>=?');
+
+export const notificationQueries = {
+  insert:      (...args: unknown[])                              => _nInsert.run(...args),
+  forUser:     (userId: string)                                  => getAll<DBNotification>(_nForUser, userId),
+  markRead:    (id: string)                                      => _nMarkRead.run(id),
+  markAllRead: (userId: string)                                  => _nMarkAllRead.run(userId),
+  existsSince: (userId: string, type: string, since: string)     => {
+    const row = _nCountSince.get(userId, type, since) as any;
+    return Number(row?.c ?? 0) > 0;
+  },
+};
 
 export default db;

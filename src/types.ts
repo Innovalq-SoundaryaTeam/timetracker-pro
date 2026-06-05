@@ -39,6 +39,8 @@ export interface Task {
   updatedAt?: string;
   groupId?: string | null;
   groupName?: string | null;
+  submission?: string | null;
+  submittedAt?: string | null;
 }
 
 export interface Group {
