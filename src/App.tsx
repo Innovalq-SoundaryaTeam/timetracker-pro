@@ -3587,7 +3587,7 @@ const TeamLeadDashboard = () => {
     fetchTeamData();
     fetchGroups();
     // Auto-refresh every 30 seconds so team lead sees live updates without reloading
-    const interval = setInterval(fetchTeamData, 30_000);
+    const interval = setInterval(fetchTeamData, 10_000);
     return () => clearInterval(interval);
   }, []);
 
@@ -5088,7 +5088,7 @@ const AdminDashboard = () => {
 
   useEffect(() => {
     fetchData();
-    const interval = setInterval(fetchData, 30_000);
+    const interval = setInterval(fetchData, 10_000);
     return () => clearInterval(interval);
   }, [token]);
 
