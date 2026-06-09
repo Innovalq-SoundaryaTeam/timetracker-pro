@@ -5105,7 +5105,7 @@ const AdminDashboard = () => {
         : 'No report submitted';
       const { hours, minutes } = calculateTotalHours(uLogs.filter(l => l.type !== 'daily_report'));
       let status = 'Offline';
-      const isWorking   = lastLog && (lastLog.type === 'login' || lastLog.type === 'lunch_out' || lastLog.type === 'break_end');
+      const isWorking   = lastLog && (lastLog.type === 'login' || lastLog.type === 'lunch_out' || lastLog.type === 'break_end' || lastLog.type === 'idle_end' || lastLog.type === 'location_update');
       const isOnBreak   = lastLog && (lastLog.type === 'lunch_in' || lastLog.type === 'break_start');
       if (uLogs.length === 0) status = 'Absent';
       else if (isWorking)     status = hours >= 9 ? 'Overtime' : 'Working';
