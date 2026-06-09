@@ -118,6 +118,7 @@ app.post('/api/logs', requireAuth, (req: AuthRequest, res: Response): void => {
 
   // Prevent duplicate consecutive events
   if (type === 'login'       && lastType === 'login')       { res.status(409).json({ error: 'Already punched in' }); return; }
+  if (type === 'login'       && lastType === 'logout')      { res.status(409).json({ error: 'Already punched out for today' }); return; }
   if (type === 'logout'      && lastType === 'logout')      { res.status(409).json({ error: 'Already punched out' }); return; }
   if (type === 'logout'      && !lastType)                  { res.status(409).json({ error: 'Not punched in yet' }); return; }
   if (type === 'break_start' && lastType === 'break_start') { res.status(409).json({ error: 'Already on break — finish current break first' }); return; }
