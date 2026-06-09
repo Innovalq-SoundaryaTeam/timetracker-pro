@@ -3607,9 +3607,17 @@ const TeamLeadDashboard = () => {
     );
     if (!last) return 'Absent';
     if (last.type === 'login' || last.type === 'break_end' || last.type === 'lunch_out') return 'Working';
+    if (last.type === 'logout') return 'Left';
+    // If last meaningful event is break_start or lunch_in, check if a location_update
+    // came in AFTER it — that means the employee is actively working again
+    const lastLocationUpdate = [...uLogs].reverse().find(l => l.type === 'location_update');
+    if (lastLocationUpdate && last.type === 'break_start') {
+      const breakTime = new Date(last.timestamp).getTime();
+      const locTime   = new Date(lastLocationUpdate.timestamp).getTime();
+      if (locTime > breakTime) return 'Working';
+    }
     if (last.type === 'break_start') return 'On Break';
     if (last.type === 'lunch_in')  return 'On Lunch';
-    if (last.type === 'logout')    return 'Left';
     return 'Absent';
   };
 
