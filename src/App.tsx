@@ -2579,12 +2579,16 @@ const UserDashboard = () => {
   const [showFinishModal, setShowFinishModal] = useState(false);
   const [isIdleWarning, setIsIdleWarning] = useState(false);  // show warning on employee screen
   const [locationError, setLocationError] = useState<string | null>(null); // location permission error
+  const [pendingBreak, setPendingBreak] = useState<'morning' | 'lunch' | 'evening' | null>(null); // selected break awaiting "Start"
   // Ref to track optimistic action — prevents fetchLogs from overwriting it too early
   const pendingActionRef = React.useRef<string | null>(null);
   // Ref to prevent duplicate submissions within 3 seconds
   const lastSubmitTimeRef = React.useRef<Record<string, number>>({});
   // Ref so idle detection always reads latest lastAction without stale closure
   const lastActionRef = React.useRef<string | null>(null);
+  // Refs so the break-reminder interval always reads latest values without stale closure
+  const breakLogRef = React.useRef<TimeLog | null>(null);
+  const isOnLunchRef = React.useRef(false);
 
   // Real-time clock — ticks every second so Active Hours stays live
   useEffect(() => {
@@ -2728,6 +2732,15 @@ const UserDashboard = () => {
 
       if (!isActivelyWorking()) {
         // Employee not working — clear any stale idle state
+        if (idleSent) resumeFromSleep();
+        return;
+      }
+
+      // If the browser tab/window is hidden OR not focused (employee switched to
+      // another app window — e.g. Microsoft Teams for a meeting/call), don't mark
+      // them idle. The tab being backgrounded/unfocused causes the heartbeat to
+      // lag, but the employee is still actively working in another app.
+      if (document.visibilityState === 'hidden' || !document.hasFocus()) {
         if (idleSent) resumeFromSleep();
         return;
       }
@@ -2882,6 +2895,8 @@ const UserDashboard = () => {
         .sort((a, b) => new Date(b.timestamp).getTime() - new Date(a.timestamp).getTime())
         .find(l => l.type === (isOnBreak ? 'break_start' : 'lunch_in')) ?? null
     : null;
+  breakLogRef.current = breakLog;
+  isOnLunchRef.current = isOnLunch;
   const bAllowedMins  = isOnLunch ? 30 : 15;
   const bElapsedSecs  = breakLog ? Math.floor((currentTime.getTime() - new Date(breakLog.timestamp).getTime()) / 1000) : 0;
   const bRemainSecs   = Math.max(0, bAllowedMins * 60 - bElapsedSecs);
@@ -2898,6 +2913,25 @@ const UserDashboard = () => {
   const lunchDone        = todayLogs.some(l => l.type === 'lunch_out');
   const breakEndCount    = todayLogs.filter(l => l.type === 'break_end').length;
   const eveningBreakDone = breakEndCount >= 2;
+
+  // ── Reminder popup: if break/lunch runs over the allowed time, keep
+  // alerting the employee every minute until they click "Finish" ──────
+  useEffect(() => {
+    if (!isOnBreak && !isOnLunch) return;
+    const checkAndAlert = () => {
+      const log = breakLogRef.current;
+      if (!log) return;
+      const allowed = isOnLunchRef.current ? 30 : 15;
+      const elapsedSecs = Math.floor((Date.now() - new Date(log.timestamp).getTime()) / 1000);
+      if (elapsedSecs >= allowed * 60) {
+        window.alert(
+          `⚠️ ${isOnLunchRef.current ? 'Lunch' : 'Break'} time is over!\nDon't forget to click "Finish ${isOnLunchRef.current ? 'Lunch' : 'Break'}" to resume work.`
+        );
+      }
+    };
+    const reminder = setInterval(checkAndAlert, 60_000);
+    return () => clearInterval(reminder);
+  }, [isOnBreak, isOnLunch]);
 
   const statusColorRing = isWorking || lastAction === 'lunch_out'
     ? 'bg-emerald-500 shadow-emerald-100 ring-emerald-50'
@@ -3154,13 +3188,46 @@ const UserDashboard = () => {
               <div className="border-t border-dashed border-gray-200 pt-4">
                 <p className="text-[10px] font-black text-gray-400 uppercase tracking-widest mb-3 flex items-center gap-1.5">
                   <Pause size={12} />
-                  Scheduled Breaks — click to start
+                  Scheduled Breaks — click to select
                 </p>
+
+                {pendingBreak && (
+                  <motion.div initial={{ opacity: 0, y: -6 }} animate={{ opacity: 1, y: 0 }}
+                    className={`mb-3 rounded-2xl border-2 p-4 flex items-center justify-between gap-3
+                      ${pendingBreak === 'lunch' ? 'bg-amber-50 border-amber-300' : pendingBreak === 'morning' ? 'bg-sky-50 border-sky-300' : 'bg-violet-50 border-violet-300'}`}>
+                    <div>
+                      <p className="text-sm font-black text-gray-800">
+                        {pendingBreak === 'morning' ? '☀️ Morning Break selected' : pendingBreak === 'lunch' ? '🍽️ Lunch Break selected' : '🌇 Evening Break selected'}
+                      </p>
+                      <p className="text-[10px] text-gray-500 font-semibold mt-0.5">
+                        Click Start when you actually begin your break — the timer starts then.
+                      </p>
+                    </div>
+                    <div className="flex items-center gap-2 shrink-0">
+                      <button
+                        onClick={() => setPendingBreak(null)}
+                        disabled={loading}
+                        className="px-4 py-2.5 rounded-xl text-xs font-black bg-white border-2 border-gray-200 text-gray-500 hover:border-gray-300"
+                      >
+                        Cancel
+                      </button>
+                      <button
+                        onClick={() => { handleAction(pendingBreak === 'lunch' ? 'lunch_in' : 'break_start'); setPendingBreak(null); }}
+                        disabled={loading}
+                        className={`px-5 py-2.5 rounded-xl text-xs font-black text-white shadow-lg
+                          ${pendingBreak === 'lunch' ? 'bg-amber-500 hover:bg-amber-600 shadow-amber-200' : pendingBreak === 'morning' ? 'bg-sky-500 hover:bg-sky-600 shadow-sky-200' : 'bg-violet-500 hover:bg-violet-600 shadow-violet-200'}`}
+                      >
+                        ▶ Start
+                      </button>
+                    </div>
+                  </motion.div>
+                )}
+
                 <div className="grid grid-cols-3 gap-3">
                   {/* Morning Break */}
                   <button
-                    onClick={() => handleAction('break_start')}
-                    disabled={loading || !isWorking || morningBreakDone}
+                    onClick={() => setPendingBreak('morning')}
+                    disabled={loading || !isWorking || morningBreakDone || !!pendingBreak}
                     className={`flex flex-col items-center justify-center gap-1.5 h-20 rounded-2xl text-xs font-black transition-all border-2
                       ${morningBreakDone
                         ? 'bg-emerald-50 border-emerald-200 text-emerald-600'
@@ -3177,8 +3244,8 @@ const UserDashboard = () => {
 
                   {/* Lunch Break */}
                   <button
-                    onClick={() => handleAction('lunch_in')}
-                    disabled={loading || !isWorking || lunchDone}
+                    onClick={() => setPendingBreak('lunch')}
+                    disabled={loading || !isWorking || lunchDone || !!pendingBreak}
                     className={`flex flex-col items-center justify-center gap-1.5 h-20 rounded-2xl text-xs font-black transition-all border-2
                       ${lunchDone
                         ? 'bg-emerald-50 border-emerald-200 text-emerald-600'
@@ -3195,8 +3262,8 @@ const UserDashboard = () => {
 
                   {/* Evening Break */}
                   <button
-                    onClick={() => handleAction('break_start')}
-                    disabled={loading || !isWorking || eveningBreakDone}
+                    onClick={() => setPendingBreak('evening')}
+                    disabled={loading || !isWorking || eveningBreakDone || !!pendingBreak}
                     className={`flex flex-col items-center justify-center gap-1.5 h-20 rounded-2xl text-xs font-black transition-all border-2
                       ${eveningBreakDone
                         ? 'bg-emerald-50 border-emerald-200 text-emerald-600'
