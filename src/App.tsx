@@ -2375,6 +2375,10 @@ const DashboardLayout = ({ children, title, showBack = false }: { children: Reac
     navItems.push({ label: 'Monthly Report', path: '/admin/monthly', icon: FileText });
   }
 
+  if (user?.role === 'teamlead') {
+    navItems.push({ label: 'Monthly Report', path: '/teamlead/monthly', icon: FileText });
+  }
+
   return (
     <div className="min-h-screen bg-gray-50 flex flex-col md:flex-row overflow-hidden">
       {/* Mobile Header */}
@@ -5416,7 +5420,425 @@ const AdminUsersPage = () => {
   );
 };
 
-const AdminMonthlyReport = () => {
+// ─── Employee Monthly Detail Modal ─────────────────────────────────────────────
+const EmployeeMonthlyDetailModal = ({
+  user,
+  allLogs,
+  selectedMonth,
+  onClose,
+}: {
+  user: UserType;
+  allLogs: TimeLog[];
+  selectedMonth: string;
+  onClose: () => void;
+}) => {
+  const monthStart = new Date(selectedMonth + '-01');
+  const monthEnd   = endOfMonth(monthStart);
+  const days       = eachDayOfInterval({ start: monthStart, end: monthEnd });
+
+  const fmtMins = (m: number) => {
+    if (m <= 0) return '—';
+    const h = Math.floor(m / 60);
+    const min = m % 60;
+    return h > 0 ? `${h}h ${min}m` : `${min}m`;
+  };
+
+  const getDayStats = (day: Date) => {
+    const dayStr  = format(day, 'yyyy-MM-dd');
+    const dayLogs = allLogs.filter(l => l.userId === user.id && l.timestamp.startsWith(dayStr));
+    const sorted  = [...dayLogs].sort((a, b) => new Date(a.timestamp).getTime() - new Date(b.timestamp).getTime());
+
+    const loginLog  = sorted.find(l => l.type === 'login');
+    const logoutLog = [...sorted].reverse().find(l => l.type === 'logout');
+
+    // Pair break_start → break_end in chronological order
+    const breakPairs: { durationMins: number }[] = [];
+    let bStart: Date | null = null;
+    for (const e of sorted.filter(l => l.type === 'break_start' || l.type === 'break_end')) {
+      if (e.type === 'break_start') { bStart = new Date(e.timestamp); }
+      else if (e.type === 'break_end' && bStart) {
+        breakPairs.push({ durationMins: Math.max(0, differenceInMinutes(new Date(e.timestamp), bStart)) });
+        bStart = null;
+      }
+    }
+
+    const lunchIn  = sorted.find(l => l.type === 'lunch_in');
+    const lunchOut = sorted.find(l => l.type === 'lunch_out');
+    const lunchMins = lunchIn && lunchOut
+      ? Math.max(0, differenceInMinutes(new Date(lunchOut.timestamp), new Date(lunchIn.timestamp)))
+      : 0;
+
+    const { hours, minutes, totalMinutes } = calculateTotalHours(dayLogs);
+    const isWeekend = day.getDay() === 0 || day.getDay() === 6;
+
+    let status: string;
+    if (isWeekend)       status = 'Weekend';
+    else if (!loginLog)  status = 'Absent';
+    else if (totalMinutes >= 480) status = 'Present';
+    else                 status = 'Half Day';
+
+    return {
+      loginTime:        loginLog  ? format(new Date(loginLog.timestamp),  'h:mm a') : '—',
+      logoutTime:       logoutLog ? format(new Date(logoutLog.timestamp), 'h:mm a') : '—',
+      hours, minutes, totalMinutes,
+      morningBreakMins: breakPairs[0]?.durationMins ?? 0,
+      eveningBreakMins: breakPairs[1]?.durationMins ?? 0,
+      lunchMins,
+      isWeekend,
+      status,
+    };
+  };
+
+  const dayRows = days.map(day => ({ day, ...getDayStats(day) }));
+
+  const totals = dayRows.filter(r => !r.isWeekend).reduce(
+    (acc, r) => ({
+      present:          acc.present  + (r.status === 'Present'  ? 1 : 0),
+      absent:           acc.absent   + (r.status === 'Absent'   ? 1 : 0),
+      halfDay:          acc.halfDay  + (r.status === 'Half Day' ? 1 : 0),
+      workMins:         acc.workMins + r.totalMinutes,
+      lunchMins:        acc.lunchMins + r.lunchMins,
+      morningBreakMins: acc.morningBreakMins + r.morningBreakMins,
+      eveningBreakMins: acc.eveningBreakMins + r.eveningBreakMins,
+    }),
+    { present: 0, absent: 0, halfDay: 0, workMins: 0, lunchMins: 0, morningBreakMins: 0, eveningBreakMins: 0 }
+  );
+
+  const exportCSV = () => {
+    const headers = ['Date', 'Day', 'Login', 'Logout', 'Working Hours', 'Morning Break', 'Lunch', 'Evening Break', 'Status'];
+    const rows = dayRows.map(r => [
+      format(r.day, 'dd MMM yyyy'),
+      format(r.day, 'EEE'),
+      r.loginTime, r.logoutTime,
+      r.totalMinutes > 0 ? `${r.hours}h ${r.minutes}m` : '—',
+      fmtMins(r.morningBreakMins),
+      fmtMins(r.lunchMins),
+      fmtMins(r.eveningBreakMins),
+      r.status,
+    ]);
+    const csv  = [headers, ...rows].map(r => r.join(',')).join('\n');
+    const blob = new Blob([csv], { type: 'text/csv;charset=utf-8;' });
+    const link = document.createElement('a');
+    link.setAttribute('href', URL.createObjectURL(blob));
+    link.setAttribute('download', `${user.name.replace(/ /g, '_')}_${selectedMonth}.csv`);
+    link.style.visibility = 'hidden';
+    document.body.appendChild(link);
+    link.click();
+    document.body.removeChild(link);
+  };
+
+  const statusCls: Record<string, string> = {
+    Present:    'bg-emerald-50 text-emerald-700 border-emerald-200',
+    Absent:     'bg-rose-50    text-rose-600    border-rose-200',
+    'Half Day': 'bg-amber-50   text-amber-700   border-amber-200',
+    Weekend:    'bg-gray-50    text-gray-400    border-gray-100',
+  };
+
+  return (
+    <AnimatePresence>
+      <div className="fixed inset-0 z-[70] flex items-center justify-center p-4">
+        <motion.div initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }}
+          className="absolute inset-0 bg-black/60 backdrop-blur-sm" onClick={onClose} />
+        <motion.div
+          initial={{ opacity: 0, scale: 0.95, y: 20 }}
+          animate={{ opacity: 1, scale: 1, y: 0 }}
+          exit={{ opacity: 0, scale: 0.95 }}
+          className="bg-white w-full max-w-5xl max-h-[92vh] rounded-3xl shadow-2xl relative flex flex-col overflow-hidden z-10"
+        >
+          {/* Header */}
+          <div className="p-5 border-b border-gray-100 flex items-center justify-between bg-indigo-50/40 flex-shrink-0">
+            <div className="flex items-center gap-3">
+              <div className="w-11 h-11 bg-indigo-600 text-white rounded-xl flex items-center justify-center font-black text-lg">
+                {user.name.charAt(0)}
+              </div>
+              <div>
+                <h3 className="text-lg font-black text-gray-900">{user.name}</h3>
+                <p className="text-xs text-gray-400">{user.email} · {format(new Date(selectedMonth + '-01'), 'MMMM yyyy')}</p>
+              </div>
+            </div>
+            <div className="flex items-center gap-2">
+              <Button variant="secondary" icon={Download} onClick={exportCSV}>Export CSV</Button>
+              <button onClick={onClose} className="p-2 hover:bg-white rounded-xl text-gray-400 hover:text-red-500 transition-all border border-transparent hover:border-gray-100">
+                <X size={22} />
+              </button>
+            </div>
+          </div>
+
+          {/* Summary strip */}
+          <div className="grid grid-cols-2 sm:grid-cols-4 gap-3 p-4 border-b border-gray-100 bg-gray-50/50 flex-shrink-0">
+            {[
+              { label: 'Present',     value: totals.present,                                         cls: 'text-emerald-600' },
+              { label: 'Absent',      value: totals.absent,                                          cls: 'text-rose-600'    },
+              { label: 'Total Hours', value: `${Math.floor(totals.workMins/60)}h ${totals.workMins%60}m`, cls: 'text-indigo-600' },
+              { label: 'Total Lunch', value: fmtMins(totals.lunchMins),                              cls: 'text-amber-600'   },
+            ].map(s => (
+              <div key={s.label} className="bg-white rounded-xl border border-gray-100 p-3 text-center shadow-sm">
+                <div className={`text-xl font-black ${s.cls}`}>{s.value}</div>
+                <div className="text-[10px] font-bold text-gray-400 uppercase tracking-wide mt-0.5">{s.label}</div>
+              </div>
+            ))}
+          </div>
+
+          {/* Table */}
+          <div className="flex-1 overflow-y-auto">
+            <table className="w-full text-left">
+              <thead className="sticky top-0 z-10 bg-white border-b border-gray-100">
+                <tr>
+                  {['Date', 'Login', 'Logout', 'Working Hrs', 'Morning Break', 'Lunch', 'Evening Break', 'Status'].map(h => (
+                    <th key={h} className="px-4 py-3 text-[10px] font-black text-gray-400 uppercase tracking-widest whitespace-nowrap">{h}</th>
+                  ))}
+                </tr>
+              </thead>
+              <tbody className="divide-y divide-gray-50">
+                {dayRows.map(r => (
+                  <tr key={format(r.day, 'yyyy-MM-dd')} className={r.isWeekend ? 'bg-gray-50/60' : 'hover:bg-indigo-50/10 transition-colors'}>
+                    <td className="px-4 py-2.5">
+                      <span className={`text-sm font-bold ${r.isWeekend ? 'text-gray-400' : 'text-gray-800'}`}>{format(r.day, 'EEE, d MMM')}</span>
+                    </td>
+                    <td className="px-4 py-2.5">
+                      <span className={`text-sm font-semibold ${r.loginTime  === '—' ? 'text-gray-300' : 'text-emerald-700'}`}>{r.loginTime}</span>
+                    </td>
+                    <td className="px-4 py-2.5">
+                      <span className={`text-sm font-semibold ${r.logoutTime === '—' ? 'text-gray-300' : 'text-rose-600'}`}>{r.logoutTime}</span>
+                    </td>
+                    <td className="px-4 py-2.5">
+                      {r.totalMinutes > 0
+                        ? <span className="text-sm font-black text-indigo-700">{r.hours}h {r.minutes}m</span>
+                        : <span className="text-gray-200 text-sm">—</span>}
+                    </td>
+                    <td className="px-4 py-2.5">
+                      <span className={`text-sm ${r.morningBreakMins > 0 ? 'text-sky-600 font-semibold' : 'text-gray-200'}`}>{fmtMins(r.morningBreakMins)}</span>
+                    </td>
+                    <td className="px-4 py-2.5">
+                      <span className={`text-sm ${r.lunchMins > 0 ? 'text-amber-600 font-semibold' : 'text-gray-200'}`}>{fmtMins(r.lunchMins)}</span>
+                    </td>
+                    <td className="px-4 py-2.5">
+                      <span className={`text-sm ${r.eveningBreakMins > 0 ? 'text-purple-600 font-semibold' : 'text-gray-200'}`}>{fmtMins(r.eveningBreakMins)}</span>
+                    </td>
+                    <td className="px-4 py-2.5">
+                      <span className={`px-2 py-0.5 rounded-lg text-[9px] font-black uppercase tracking-wider border ${statusCls[r.status] ?? 'bg-gray-50 text-gray-400 border-gray-100'}`}>
+                        {r.status}
+                      </span>
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        </motion.div>
+      </div>
+    </AnimatePresence>
+  );
+};
+
+// ─── Shared Monthly Report Page (Admin + TeamLead) ──────────────────────────────
+const MonthlyReportPage = ({ apiEndpoint }: { apiEndpoint: string }) => {
+  const { token } = useAuth();
+  const [allUsers, setAllUsers] = useState<UserType[]>([]);
+  const [allLogs, setAllLogs] = useState<TimeLog[]>([]);
+  const [selectedMonth, setSelectedMonth] = useState(format(new Date(), 'yyyy-MM'));
+  const [loading, setLoading] = useState(true);
+  const [detailEmployee, setDetailEmployee] = useState<UserType | null>(null);
+
+  useEffect(() => {
+    const fetchData = async () => {
+      setLoading(true);
+      const res = await apiFetch(apiEndpoint, { headers: { Authorization: `Bearer ${token}` } });
+      if (!res.ok) { setLoading(false); return; }
+      const json = await res.json();
+      setAllUsers(Array.isArray(json.users) ? json.users : []);
+      setAllLogs(Array.isArray(json.logs)  ? json.logs  : []);
+      setLoading(false);
+    };
+    fetchData();
+  }, [token, apiEndpoint]);
+
+  const TARGET_HOURS = 168;
+
+  const monthlyData = allUsers
+    .filter(u => !u.isDeleted && u.role === 'user')
+    .map(u => {
+      const monthLogs    = allLogs.filter(l => l.userId === u.id && l.timestamp.startsWith(selectedMonth));
+      const { totalMinutes } = calculateTotalHours(monthLogs);
+      const hoursWorked  = Math.floor(totalMinutes / 60);
+      const minsWorked   = totalMinutes % 60;
+      const varianceHours = totalMinutes / 60 - TARGET_HOURS;
+      const pct          = Math.min(100, Math.round((totalMinutes / 60 / TARGET_HOURS) * 100));
+      return { user: u, hoursWorked, minsWorked, totalMinutes, varianceHours, pct };
+    });
+
+  const monthOptions: string[] = [];
+  for (let i = 0; i < 12; i++) {
+    const d = new Date(); d.setDate(1); d.setMonth(d.getMonth() - i);
+    monthOptions.push(format(d, 'yyyy-MM'));
+  }
+
+  const handleDownload = () => {
+    const headers = ['Employee', 'Email', 'Department', 'Hours Worked', 'Target (168h)', 'Variance', 'Completion %', 'Status', 'Month'];
+    const rows = monthlyData.map(r => [
+      r.user.name, r.user.email, r.user.department || 'N/A',
+      `${r.hoursWorked}h ${r.minsWorked}m`, '168h 0m',
+      `${r.varianceHours >= 0 ? '+' : ''}${r.varianceHours.toFixed(1)}h`,
+      `${r.pct}%`,
+      r.totalMinutes >= TARGET_HOURS * 60 ? 'Met' : `Short by ${Math.ceil(TARGET_HOURS - r.totalMinutes / 60)}h`,
+      selectedMonth,
+    ]);
+    const csvContent = [headers, ...rows].map(e => e.join(',')).join('\n');
+    const blob = new Blob([csvContent], { type: 'text/csv;charset=utf-8;' });
+    const link = document.createElement('a');
+    link.setAttribute('href', URL.createObjectURL(blob));
+    link.setAttribute('download', `monthly-report-${selectedMonth}.csv`);
+    link.style.visibility = 'hidden';
+    document.body.appendChild(link);
+    link.click();
+    document.body.removeChild(link);
+  };
+
+  return (
+    <DashboardLayout title="Monthly Report" showBack>
+      <div className="mb-6 flex flex-col sm:flex-row gap-4 justify-between items-start sm:items-center px-1">
+        <div>
+          <h2 className="text-2xl font-black text-gray-900">Monthly Attendance Report</h2>
+          <p className="text-sm text-gray-500 mt-1">Click any employee name to see their full day-by-day breakdown.</p>
+        </div>
+        <div className="flex gap-3 items-center">
+          <select
+            value={selectedMonth}
+            onChange={e => setSelectedMonth(e.target.value)}
+            className="px-4 py-2.5 bg-white border border-gray-200 rounded-xl text-sm font-medium text-gray-700 focus:ring-2 focus:ring-indigo-500 outline-none shadow-sm"
+          >
+            {monthOptions.map(m => (
+              <option key={m} value={m}>{format(new Date(m + '-01'), 'MMMM yyyy')}</option>
+            ))}
+          </select>
+          <Button variant="primary" icon={Download} onClick={handleDownload}>Download CSV</Button>
+        </div>
+      </div>
+
+      {loading ? (
+        <div className="flex items-center justify-center h-48 text-gray-400">Loading…</div>
+      ) : (
+        <>
+          {/* Summary tiles */}
+          <div className="grid grid-cols-2 md:grid-cols-4 gap-4 mb-6">
+            {(() => {
+              const total  = monthlyData.length;
+              const met    = monthlyData.filter(r => r.totalMinutes >= TARGET_HOURS * 60).length;
+              const short  = total - met;
+              const avgPct = total > 0 ? Math.round(monthlyData.reduce((s, r) => s + r.pct, 0) / total) : 0;
+              return (
+                <>
+                  <Card className="p-5 bg-white rounded-2xl border border-gray-100 shadow-sm text-center">
+                    <div className="text-3xl font-extrabold text-gray-800">{total}</div>
+                    <div className="text-xs font-medium text-gray-500 mt-1 uppercase tracking-wide">Employees</div>
+                  </Card>
+                  <Card className="p-5 bg-emerald-50 rounded-2xl border border-emerald-100 shadow-sm text-center">
+                    <div className="text-3xl font-extrabold text-emerald-600">{met}</div>
+                    <div className="text-xs font-medium text-emerald-600 mt-1 uppercase tracking-wide">Met Target</div>
+                  </Card>
+                  <Card className="p-5 bg-rose-50 rounded-2xl border border-rose-100 shadow-sm text-center">
+                    <div className="text-3xl font-extrabold text-rose-500">{short}</div>
+                    <div className="text-xs font-medium text-rose-500 mt-1 uppercase tracking-wide">Below Target</div>
+                  </Card>
+                  <Card className="p-5 bg-indigo-50 rounded-2xl border border-indigo-100 shadow-sm text-center">
+                    <div className="text-3xl font-extrabold text-indigo-600">{avgPct}%</div>
+                    <div className="text-xs font-medium text-indigo-500 mt-1 uppercase tracking-wide">Avg Completion</div>
+                  </Card>
+                </>
+              );
+            })()}
+          </div>
+
+          {/* Table */}
+          <Card className="bg-white rounded-2xl border border-gray-100 shadow-sm overflow-hidden">
+            <div className="overflow-x-auto">
+              <table className="w-full text-sm">
+                <thead>
+                  <tr className="bg-gray-50 border-b border-gray-100">
+                    <th className="px-6 py-4 text-left text-xs font-semibold text-gray-500 uppercase tracking-wide">Employee</th>
+                    <th className="px-6 py-4 text-left text-xs font-semibold text-gray-500 uppercase tracking-wide">Department</th>
+                    <th className="px-6 py-4 text-right text-xs font-semibold text-gray-500 uppercase tracking-wide">Hours Worked</th>
+                    <th className="px-6 py-4 text-right text-xs font-semibold text-gray-500 uppercase tracking-wide">Target</th>
+                    <th className="px-6 py-4 text-right text-xs font-semibold text-gray-500 uppercase tracking-wide">Variance</th>
+                    <th className="px-6 py-4 text-center text-xs font-semibold text-gray-500 uppercase tracking-wide">Progress</th>
+                    <th className="px-6 py-4 text-center text-xs font-semibold text-gray-500 uppercase tracking-wide">Status</th>
+                  </tr>
+                </thead>
+                <tbody className="divide-y divide-gray-50">
+                  {monthlyData.length === 0 ? (
+                    <tr><td colSpan={7} className="px-6 py-12 text-center text-gray-400">No employee data for this month.</td></tr>
+                  ) : monthlyData.map(r => {
+                    const met      = r.totalMinutes >= TARGET_HOURS * 60;
+                    const shortHrs = Math.ceil(TARGET_HOURS - r.totalMinutes / 60);
+                    return (
+                      <tr key={r.user.id} className="hover:bg-indigo-50/20 transition-colors group">
+                        <td className="px-6 py-4">
+                          <div className="flex items-center gap-3">
+                            <div className="w-9 h-9 rounded-lg bg-indigo-50 text-indigo-700 flex items-center justify-center font-bold text-sm border border-indigo-100 group-hover:bg-indigo-600 group-hover:text-white transition-all">
+                              {r.user.name.charAt(0)}
+                            </div>
+                            <div>
+                              <button
+                                type="button"
+                                onClick={() => setDetailEmployee(r.user)}
+                                className="font-semibold text-gray-800 hover:text-indigo-600 hover:underline text-left transition-colors"
+                              >
+                                {r.user.name}
+                              </button>
+                              <div className="text-xs text-gray-400">{r.user.email}</div>
+                            </div>
+                          </div>
+                        </td>
+                        <td className="px-6 py-4 text-gray-500">{r.user.department || '—'}</td>
+                        <td className="px-6 py-4 text-right font-semibold text-gray-800">{r.hoursWorked}h {r.minsWorked}m</td>
+                        <td className="px-6 py-4 text-right text-gray-500">168h</td>
+                        <td className={`px-6 py-4 text-right font-semibold ${r.varianceHours >= 0 ? 'text-emerald-600' : 'text-rose-500'}`}>
+                          {r.varianceHours >= 0 ? '+' : ''}{r.varianceHours.toFixed(1)}h
+                        </td>
+                        <td className="px-6 py-4">
+                          <div className="flex items-center gap-2">
+                            <div className="flex-1 bg-gray-100 rounded-full h-2 min-w-[80px]">
+                              <div className={`h-2 rounded-full transition-all ${met ? 'bg-emerald-500' : 'bg-indigo-400'}`}
+                                style={{ width: `${r.pct}%` }} />
+                            </div>
+                            <span className="text-xs font-medium text-gray-500 w-10 text-right">{r.pct}%</span>
+                          </div>
+                        </td>
+                        <td className="px-6 py-4 text-center">
+                          {met ? (
+                            <span className="inline-flex items-center gap-1 px-2.5 py-1 rounded-full text-xs font-semibold bg-emerald-50 text-emerald-700 border border-emerald-200">✅ Met</span>
+                          ) : (
+                            <span className="inline-flex items-center gap-1 px-2.5 py-1 rounded-full text-xs font-semibold bg-rose-50 text-rose-600 border border-rose-200">⚠️ Short {shortHrs}h</span>
+                          )}
+                        </td>
+                      </tr>
+                    );
+                  })}
+                </tbody>
+              </table>
+            </div>
+          </Card>
+        </>
+      )}
+
+      {/* Employee detail modal */}
+      {detailEmployee && (
+        <EmployeeMonthlyDetailModal
+          user={detailEmployee}
+          allLogs={allLogs}
+          selectedMonth={selectedMonth}
+          onClose={() => setDetailEmployee(null)}
+        />
+      )}
+    </DashboardLayout>
+  );
+};
+
+const AdminMonthlyReport    = () => <MonthlyReportPage apiEndpoint="/api/admin/data" />;
+const TeamLeadMonthlyReport = () => <MonthlyReportPage apiEndpoint="/api/teamlead/data" />;
+
+// Keep old AdminMonthlyReport_UNUSED for reference — delete later
+const AdminMonthlyReport_UNUSED = () => {
   const { token } = useAuth();
   const [allUsers, setAllUsers] = useState<UserType[]>([]);
   const [allLogs, setAllLogs] = useState<TimeLog[]>([]);
@@ -5809,6 +6231,8 @@ export default function App() {
           {/* Team Lead routes */}
           <Route path="/teamlead"
             element={user && user.role === 'teamlead' ? <TeamLeadDashboard /> : <Navigate to="/login" replace />} />
+          <Route path="/teamlead/monthly"
+            element={user && user.role === 'teamlead' ? <TeamLeadMonthlyReport /> : <Navigate to="/login" replace />} />
 
           {/* Admin routes */}
           <Route path="/admin"
