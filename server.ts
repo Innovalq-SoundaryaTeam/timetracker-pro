@@ -143,11 +143,12 @@ app.post('/api/logs', requireAuth, (req: AuthRequest, res: Response): void => {
 // ─── Admin routes ─────────────────────────────────────────────────────────────
 
 app.get('/api/admin/data', requireAuth, requireAdmin, (_req: Request, res: Response): void => {
-  res.json({ users: userQueries.findAll().map(safeUser), logs: logQueries.all().map(formatLog) });
+  // Use recent() — last 90 days — to keep payload small; per-date modal uses /attendance/:date
+  res.json({ users: userQueries.findAll().map(safeUser), logs: logQueries.recent().map(formatLog) });
 });
 
 app.get('/api/teamlead/data', requireAuth, requireTeamLead, (_req: Request, res: Response): void => {
-  res.json({ users: userQueries.findByRole('user').map(safeUser), logs: logQueries.all().map(formatLog) });
+  res.json({ users: userQueries.findByRole('user').map(safeUser), logs: logQueries.recent().map(formatLog) });
 });
 
 // GET /api/admin/attendance/:date — per-day attendance for every employee

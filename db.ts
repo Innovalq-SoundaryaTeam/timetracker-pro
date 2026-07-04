@@ -226,12 +226,15 @@ const _lInsert     = db.prepare(
 );
 const _lForUser    = db.prepare('SELECT * FROM time_logs WHERE userId=? ORDER BY timestamp DESC');
 const _lAll        = db.prepare('SELECT * FROM time_logs ORDER BY timestamp DESC');
+// Returns only logs from the last 90 days — keeps API payload small for the admin calendar
+const _lRecent     = db.prepare("SELECT * FROM time_logs WHERE timestamp >= datetime('now', '-90 days') ORDER BY timestamp DESC");
 const _lAllOnDate  = db.prepare("SELECT * FROM time_logs WHERE date(timestamp)=? ORDER BY timestamp ASC");
 
 export const logQueries = {
   insert:    (...args: unknown[]) => _lInsert.run(...args),
   forUser:   (userId: string)     => getAll<DBLog>(_lForUser, userId),
   all:       ()                   => getAll<DBLog>(_lAll),
+  recent:    ()                   => getAll<DBLog>(_lRecent),
   allOnDate: (date: string)       => getAll<DBLog>(_lAllOnDate, date),
 };
 
