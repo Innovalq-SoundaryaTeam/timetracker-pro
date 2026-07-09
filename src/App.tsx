@@ -2795,16 +2795,35 @@ const UserDashboard = () => {
     return () => clearInterval(interval);
   }, [token, lastAction]);
 
-  const submitPunchEvent = async (type: string, location: { lat: number; lng: number } | null) => {
+  const submitPunchEvent = async (type: string, location: { lat: number; lng: number } | null, prevAction: string | null) => {
     try {
       const res = await apiFetch('/api/logs', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
         body: JSON.stringify({ type, location, note }),
       });
-      if (res.ok) { setNote(''); fetchLogs(); }
-      else { pendingActionRef.current = null; } // clear on failure
-    } catch (err) { console.error('Punch event failed:', err); pendingActionRef.current = null; }
+      if (res.ok) {
+        setNote('');
+        fetchLogs();
+      } else {
+        // Revert optimistic state on server rejection
+        pendingActionRef.current = null;
+        setLastAction(prevAction);
+        setPendingBreak(null);
+        const json = await res.json().catch(() => ({}));
+        const msg = (json as any).error ?? 'Action failed. Please try again.';
+        console.warn(`[TimeTracker] ${type} rejected:`, msg);
+        if (res.status !== 409) {
+          // Show non-conflict errors to the user
+          window.alert(`⚠️ ${msg}`);
+        }
+      }
+    } catch (err) {
+      console.error('Punch event failed:', err);
+      pendingActionRef.current = null;
+      setLastAction(prevAction); // revert optimistic state
+      setPendingBreak(null);
+    }
     finally { setLoading(false); }
   };
 
@@ -2825,10 +2844,11 @@ const UserDashboard = () => {
       }
       setLoading(true);
       pendingActionRef.current = type;
+      const prevLoginAction = lastAction;
       navigator.geolocation.getCurrentPosition(
         pos => {
           setLastAction(type); // optimistic update only after location confirmed
-          submitPunchEvent(type, { lat: pos.coords.latitude, lng: pos.coords.longitude });
+          submitPunchEvent(type, { lat: pos.coords.latitude, lng: pos.coords.longitude }, prevLoginAction);
         },
         err => {
           setLoading(false);
@@ -2847,13 +2867,14 @@ const UserDashboard = () => {
     }
 
     // For all other actions, location is captured but not mandatory
+    const prevAction = lastAction;
     setLoading(true);
     pendingActionRef.current = type;
     setLastAction(type); // optimistic update
-    if (!navigator.geolocation) { submitPunchEvent(type, null); return; }
+    if (!navigator.geolocation) { submitPunchEvent(type, null, prevAction); return; }
     navigator.geolocation.getCurrentPosition(
-      pos => submitPunchEvent(type, { lat: pos.coords.latitude, lng: pos.coords.longitude }),
-      _err => submitPunchEvent(type, null), // non-login: proceed without location
+      pos => submitPunchEvent(type, { lat: pos.coords.latitude, lng: pos.coords.longitude }, prevAction),
+      _err => submitPunchEvent(type, null, prevAction), // non-login: proceed without location
       { timeout: 8000, maximumAge: 60000, enableHighAccuracy: true }
     );
   };
@@ -2917,6 +2938,15 @@ const UserDashboard = () => {
   const lunchDone        = todayLogs.some(l => l.type === 'lunch_out');
   const breakEndCount    = todayLogs.filter(l => l.type === 'break_end').length;
   const eveningBreakDone = breakEndCount >= 2;
+
+  // ── Auto-clear pendingBreak when break/lunch is already active ──────
+  // (guards against race: user clicks break button, server responds,
+  //  but pendingBreak confirmation card is still shown)
+  useEffect(() => {
+    if ((isOnBreak || isOnLunch) && pendingBreak) {
+      setPendingBreak(null);
+    }
+  }, [isOnBreak, isOnLunch, pendingBreak]);
 
   // ── Reminder popup: if break/lunch runs over the allowed time, keep
   // alerting the employee every minute until they click "Finish" ──────

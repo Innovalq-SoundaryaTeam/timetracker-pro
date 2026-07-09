@@ -71,7 +71,7 @@ app.post('/api/auth/register', (req: Request, res: Response): void => {
   userQueries.insert(id, name, email, hash, phone ?? null, 'user', null, null, null, null, null, 'active');
 
   const user  = userQueries.findById(id)!;
-  const token = jwt.sign({ userId: id }, JWT_SECRET, { expiresIn: '8h' });
+  const token = jwt.sign({ userId: id }, JWT_SECRET, { expiresIn: '14h' });
   res.json({ token, user: safeUser(user) });
 });
 
@@ -85,7 +85,7 @@ app.post('/api/auth/login', (req: Request, res: Response): void => {
   }
   if (user.status === 'inactive') { res.status(403).json({ error: 'Account inactive. Contact admin.' }); return; }
 
-  const token = jwt.sign({ userId: user.id }, JWT_SECRET, { expiresIn: '8h' });
+  const token = jwt.sign({ userId: user.id }, JWT_SECRET, { expiresIn: '14h' });
   res.json({ token, user: safeUser(user) });
 });
 
