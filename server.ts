@@ -90,9 +90,30 @@ app.post('/api/auth/login', (req: Request, res: Response): void => {
 });
 
 // ─── Log routes ───────────────────────────────────────────────────────────────
+// Per-user cache for GET /api/logs (10s TTL). Invalidated on every POST so
+// the employee sees their own punch reflected immediately after submitting.
+const _logsCache = new Map<string, { payload: string; ts: number }>();
+const _LOGS_TTL  = 10_000;
+
+function invalidateLogsCache(userId: string): void {
+  _logsCache.delete(userId);
+  // Also bust the today-caches so admin/teamlead dashboards pick up the new event
+  _todayCache.delete('admin');
+  _todayCache.delete('teamlead');
+}
 
 app.get('/api/logs', requireAuth, (req: AuthRequest, res: Response): void => {
-  res.json(logQueries.forUser(req.user!.id).map(formatLog));
+  const userId = req.user!.id;
+  const hit = _logsCache.get(userId);
+  if (hit && Date.now() - hit.ts < _LOGS_TTL) {
+    res.setHeader('Content-Type', 'application/json');
+    res.send(hit.payload);
+    return;
+  }
+  const payload = JSON.stringify(logQueries.forUser(userId).map(formatLog));
+  _logsCache.set(userId, { payload, ts: Date.now() });
+  res.setHeader('Content-Type', 'application/json');
+  res.send(payload);
 });
 
 app.post('/api/logs', requireAuth, (req: AuthRequest, res: Response): void => {
@@ -104,15 +125,16 @@ app.post('/api/logs', requireAuth, (req: AuthRequest, res: Response): void => {
   const todayStr = new Date().toISOString().slice(0, 10);
 
   // ── Duplicate prevention ──────────────────────────────────────────────────
-  // Get today's logs for this user, sorted ascending
-  const allUserLogs = logQueries.forUser(userId)
-    .filter(l => l.timestamp.startsWith(todayStr))
-    .sort((a, b) => new Date(a.timestamp).getTime() - new Date(b.timestamp).getTime());
+  // Use allOnDate (today only) instead of forUser (90 days) — much faster
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const allUserLogs = (logQueries.allOnDate(todayStr) as any[])
+    .filter((l: any) => l.userId === userId)
+    .sort((a: any, b: any) => new Date(a.timestamp).getTime() - new Date(b.timestamp).getTime());
 
   // Last meaningful log (ignoring idle and location updates)
   const lastMeaningful = [...allUserLogs]
     .reverse()
-    .find(l => !['idle_start','idle_end','location_update','daily_report'].includes(l.type));
+    .find((l: any) => !['idle_start','idle_end','location_update','daily_report'].includes(l.type));
 
   const lastType = lastMeaningful?.type ?? null;
 
@@ -137,6 +159,7 @@ app.post('/api/logs', requireAuth, (req: AuthRequest, res: Response): void => {
   const id = randomUUID();
   const ts = new Date().toISOString();
   logQueries.insert(id, userId, type, ts, note ?? null, location?.lat ?? null, location?.lng ?? null);
+  invalidateLogsCache(userId); // bust per-user cache + admin/teamlead today caches
   res.json(formatLog({ id, userId, type, timestamp: ts, note: note ?? null, lat: location?.lat ?? null, lng: location?.lng ?? null }));
 });
 
