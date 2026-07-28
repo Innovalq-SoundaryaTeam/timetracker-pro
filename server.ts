@@ -141,14 +141,112 @@ app.post('/api/logs', requireAuth, (req: AuthRequest, res: Response): void => {
 });
 
 // ─── Admin routes ─────────────────────────────────────────────────────────────
+// Cache for the heavy /data endpoints — logQueries.recent() loads 90 days of data
+// for all users and is slow under concurrent load. Cache for 90 seconds so the
+// DB is hit at most once per 90s instead of on every dashboard load.
+const _dataCache = new Map<string, { payload: string; ts: number }>();
+const _DATA_TTL  = 90_000; // 90 seconds
 
 app.get('/api/admin/data', requireAuth, requireAdmin, (_req: Request, res: Response): void => {
-  // Use recent() — last 90 days — to keep payload small; per-date modal uses /attendance/:date
-  res.json({ users: userQueries.findAll().map(safeUser), logs: logQueries.recent().map(formatLog) });
+  const hit = _dataCache.get('admin');
+  if (hit && Date.now() - hit.ts < _DATA_TTL) {
+    res.setHeader('Content-Type', 'application/json');
+    res.send(hit.payload);
+    return;
+  }
+  const payload = JSON.stringify({ users: userQueries.findAll().map(safeUser), logs: logQueries.recent().map(formatLog) });
+  _dataCache.set('admin', { payload, ts: Date.now() });
+  res.setHeader('Content-Type', 'application/json');
+  res.send(payload);
 });
 
 app.get('/api/teamlead/data', requireAuth, requireTeamLead, (_req: Request, res: Response): void => {
-  res.json({ users: userQueries.findByRole('user').map(safeUser), logs: logQueries.recent().map(formatLog) });
+  const hit = _dataCache.get('teamlead');
+  if (hit && Date.now() - hit.ts < _DATA_TTL) {
+    res.setHeader('Content-Type', 'application/json');
+    res.send(hit.payload);
+    return;
+  }
+  const payload = JSON.stringify({ users: userQueries.findByRole('user').map(safeUser), logs: logQueries.recent().map(formatLog) });
+  _dataCache.set('teamlead', { payload, ts: Date.now() });
+  res.setHeader('Content-Type', 'application/json');
+  res.send(payload);
+});
+
+// ─── Today-only endpoints (used by live dashboards — very fast) ──────────────
+// Returns only today's logs so dashboards don't load 90 days on every 10s poll.
+const _todayCache = new Map<string, { payload: string; ts: number }>();
+const _TODAY_TTL  = 10_000; // 10-second cache matches dashboard poll interval
+
+app.get('/api/admin/today', requireAuth, requireAdmin, (_req: Request, res: Response): void => {
+  const hit = _todayCache.get('admin');
+  if (hit && Date.now() - hit.ts < _TODAY_TTL) {
+    res.setHeader('Content-Type', 'application/json');
+    res.send(hit.payload);
+    return;
+  }
+  const todayStr = new Date().toISOString().slice(0, 10);
+  const users    = userQueries.findAll().map(safeUser);
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const logs     = (logQueries.allOnDate(todayStr) as any[]).map(formatLog);
+  const payload  = JSON.stringify({ users, logs });
+  _todayCache.set('admin', { payload, ts: Date.now() });
+  res.setHeader('Content-Type', 'application/json');
+  res.send(payload);
+});
+
+app.get('/api/teamlead/today', requireAuth, requireTeamLead, (_req: Request, res: Response): void => {
+  const hit = _todayCache.get('teamlead');
+  if (hit && Date.now() - hit.ts < _TODAY_TTL) {
+    res.setHeader('Content-Type', 'application/json');
+    res.send(hit.payload);
+    return;
+  }
+  const todayStr = new Date().toISOString().slice(0, 10);
+  const users    = userQueries.findByRole('user').map(safeUser);
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const logs     = (logQueries.allOnDate(todayStr) as any[]).map(formatLog);
+  const payload  = JSON.stringify({ users, logs });
+  _todayCache.set('teamlead', { payload, ts: Date.now() });
+  res.setHeader('Content-Type', 'application/json');
+  res.send(payload);
+});
+
+// ─── Attendance range endpoints (fast: only fetches the selected cycle window) ─
+// Caches responses for 5 minutes so repeated page loads don't re-query the DB.
+const _attCache = new Map<string, { data: object; ts: number }>();
+const _ATT_TTL  = 5 * 60_000;
+
+function _buildAttRange(start: string, end: string, users: object[]): object {
+  const logs: object[] = [];
+  const s = new Date(start + 'T00:00:00Z');
+  const e = new Date(end   + 'T00:00:00Z');
+  for (let d = new Date(s); d <= e; d.setUTCDate(d.getUTCDate() + 1))
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    (logQueries.allOnDate(d.toISOString().slice(0, 10)) as any[]).forEach(l => logs.push(formatLog(l)));
+  return { users, logs };
+}
+
+app.get('/api/admin/attendance-range', requireAuth, requireAdmin, (req: Request, res: Response): void => {
+  const { start, end } = req.query as { start?: string; end?: string };
+  if (!start || !end) { res.status(400).json({ error: 'start and end required' }); return; }
+  const key = `a:${start}:${end}`;
+  const hit = _attCache.get(key);
+  if (hit && Date.now() - hit.ts < _ATT_TTL) { res.json(hit.data); return; }
+  const data = _buildAttRange(start, end, userQueries.findAll().map(safeUser));
+  _attCache.set(key, { data, ts: Date.now() });
+  res.json(data);
+});
+
+app.get('/api/teamlead/attendance-range', requireAuth, requireTeamLead, (req: Request, res: Response): void => {
+  const { start, end } = req.query as { start?: string; end?: string };
+  if (!start || !end) { res.status(400).json({ error: 'start and end required' }); return; }
+  const key = `t:${start}:${end}`;
+  const hit = _attCache.get(key);
+  if (hit && Date.now() - hit.ts < _ATT_TTL) { res.json(hit.data); return; }
+  const data = _buildAttRange(start, end, userQueries.findByRole('user').map(safeUser));
+  _attCache.set(key, { data, ts: Date.now() });
+  res.json(data);
 });
 
 // GET /api/admin/attendance/:date — per-day attendance for every employee

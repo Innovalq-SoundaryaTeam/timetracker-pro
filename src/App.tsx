@@ -1,4 +1,4 @@
-import React, { useState, useEffect, createContext, useContext, useMemo, ReactNode, FormEvent } from 'react';
+import React, { useState, useEffect, useCallback, createContext, useContext, useMemo, ReactNode, FormEvent } from 'react';
 import { 
   BrowserRouter, 
   Routes, 
@@ -58,6 +58,7 @@ import {
   EyeOff,
   Monitor,
   WifiOff,
+  RefreshCw,
 } from 'lucide-react';
 import { motion, AnimatePresence } from 'motion/react';
 import { 
@@ -2211,7 +2212,7 @@ const NotificationBell = () => {
       } else {
         const [taskRes, teamRes] = await Promise.all([
           apiFetch('/api/tasks',          { headers: { Authorization: `Bearer ${token}` } }),
-          apiFetch('/api/teamlead/data',  { headers: { Authorization: `Bearer ${token}` } }),
+          apiFetch('/api/teamlead/today',  { headers: { Authorization: `Bearer ${token}` } }),
         ]);
         if (!taskRes.ok) { setNotifications(sysNotifs); return; }
         const tasks: Task[]        = await taskRes.json();
@@ -2373,10 +2374,12 @@ const DashboardLayout = ({ children, title, showBack = false }: { children: Reac
   if (user?.role === 'admin') {
     navItems.push({ label: 'Employees', path: '/admin/users', icon: User });
     navItems.push({ label: 'Monthly Report', path: '/admin/monthly', icon: FileText });
+    navItems.push({ label: 'Attendance Report', path: '/admin/attendance', icon: Calendar });
   }
 
   if (user?.role === 'teamlead') {
     navItems.push({ label: 'Monthly Report', path: '/teamlead/monthly', icon: FileText });
+    navItems.push({ label: 'Attendance Report', path: '/teamlead/attendance', icon: Calendar });
   }
 
   return (
@@ -3667,7 +3670,7 @@ const TeamLeadDashboard = () => {
   const fetchTeamData = async () => {
     try {
       const [teamRes, taskRes] = await Promise.all([
-        apiFetch('/api/teamlead/data', { headers: { Authorization: `Bearer ${token}` } }),
+        apiFetch('/api/teamlead/today', { headers: { Authorization: `Bearer ${token}` } }),
         apiFetch('/api/tasks',         { headers: { Authorization: `Bearer ${token}` } }),
       ]);
       if (teamRes.ok) {
@@ -5185,7 +5188,7 @@ const AdminDashboard = () => {
 
   const fetchData = async () => {
     try {
-      const res = await apiFetch('/api/admin/data', { headers: { Authorization: `Bearer ${token}` } });
+      const res = await apiFetch('/api/admin/today', { headers: { Authorization: `Bearer ${token}` } });
       if (!res.ok) return; // don't overwrite state on 401/403
       const json = await res.json();
       setData({
@@ -5205,9 +5208,8 @@ const AdminDashboard = () => {
     const todayStr  = format(new Date(), 'yyyy-MM-dd');
     const todayLogs = data.logs.filter(l => format(new Date(l.timestamp), 'yyyy-MM-dd') === todayStr);
     return data.users.filter(u => u.role === 'user').map(user => {
-      const uLogs    = todayLogs.filter(l => l.userId === user.id);
-      const allULogs = data.logs.filter(l => l.userId === user.id);
-      const lastLog  = [...allULogs].reverse().find((l: any) => l.type !== 'daily_report');
+      const uLogs   = todayLogs.filter(l => l.userId === user.id);
+      const lastLog = [...uLogs].reverse().find((l: any) => l.type !== 'daily_report');
       const todayDailyReports = uLogs.filter(l => l.type === 'daily_report');
       const latestReport = todayDailyReports.length > 0
         ? [...todayDailyReports].sort((a, b) => new Date(b.timestamp).getTime() - new Date(a.timestamp).getTime())[0].note
@@ -5670,19 +5672,6 @@ const MonthlyReportPage = ({ apiEndpoint }: { apiEndpoint: string }) => {
   const [loading, setLoading] = useState(true);
   const [detailEmployee, setDetailEmployee] = useState<UserType | null>(null);
 
-  useEffect(() => {
-    const fetchData = async () => {
-      setLoading(true);
-      const res = await apiFetch(apiEndpoint, { headers: { Authorization: `Bearer ${token}` } });
-      if (!res.ok) { setLoading(false); return; }
-      const json = await res.json();
-      setAllUsers(Array.isArray(json.users) ? json.users : []);
-      setAllLogs(Array.isArray(json.logs)  ? json.logs  : []);
-      setLoading(false);
-    };
-    fetchData();
-  }, [token, apiEndpoint]);
-
   const TARGET_HOURS = 168;
 
   const monthlyData = allUsers
@@ -5866,6 +5855,289 @@ const MonthlyReportPage = ({ apiEndpoint }: { apiEndpoint: string }) => {
 
 const AdminMonthlyReport    = () => <MonthlyReportPage apiEndpoint="/api/admin/data" />;
 const TeamLeadMonthlyReport = () => <MonthlyReportPage apiEndpoint="/api/teamlead/data" />;
+
+// ─── Attendance Report (25th–24th cycles) ────────────────────────────────────
+const AttendanceReportPage = ({ rangeEndpoint }: { rangeEndpoint: string }) => {
+  const { token } = useAuth();
+  const [allUsers, setAllUsers]   = useState<UserType[]>([]);
+  const [allLogs,  setAllLogs]    = useState<TimeLog[]>([]);
+  const [loading,  setLoading]    = useState(true);
+  const [search,   setSearch]     = useState('');
+  const [lastUpdated, setLastUpdated] = useState<Date | null>(null);
+  const [refreshing, setRefreshing]   = useState(false);
+
+  // Default cycle computed before fetchData so selectedCycle can be in its dep array
+  const defaultCycle = useMemo(() => {
+    const today = new Date();
+    const d = today.getDate();
+    if (d >= 25) {
+      const s = new Date(today.getFullYear(), today.getMonth(), 25);
+      const e = new Date(today.getFullYear(), today.getMonth() + 1, 24);
+      return { startDate: format(s,'yyyy-MM-dd'), endDate: format(e,'yyyy-MM-dd'),
+               label: `${format(s,'MMM d')} – ${format(e,'MMM d, yyyy')}` };
+    } else {
+      const s = new Date(today.getFullYear(), today.getMonth() - 1, 25);
+      const e = new Date(today.getFullYear(), today.getMonth(), 24);
+      return { startDate: format(s,'yyyy-MM-dd'), endDate: format(e,'yyyy-MM-dd'),
+               label: `${format(s,'MMM d')} – ${format(e,'MMM d, yyyy')}` };
+    }
+  }, []);
+
+  const [selectedCycle, setSelectedCycle] = useState(defaultCycle);
+
+  const fetchData = useCallback(async (silent = false) => {
+    if (!silent) setLoading(true); else setRefreshing(true);
+    try {
+      const res = await apiFetch(
+        `${rangeEndpoint}?start=${selectedCycle.startDate}&end=${selectedCycle.endDate}`,
+        { headers: { Authorization: `Bearer ${token}` } }
+      );
+      if (!res.ok) return;
+      const json = await res.json();
+      setAllUsers(Array.isArray(json.users) ? json.users : []);
+      setAllLogs(Array.isArray(json.logs)  ? json.logs  : []);
+      setLastUpdated(new Date());
+    } finally {
+      setLoading(false);
+      setRefreshing(false);
+    }
+  }, [token, rangeEndpoint, selectedCycle]);
+
+  // Initial load + auto-refresh every 5 minutes; re-runs automatically when cycle changes
+  useEffect(() => {
+    fetchData(false);
+    const interval = setInterval(() => fetchData(true), 300_000);
+    return () => clearInterval(interval);
+  }, [fetchData]);
+
+  // Build list of cycle options: each cycle starts on 25th of month M, ends 24th of M+1
+  const cycleOptions = useMemo(() => {
+    const opts: { label: string; startDate: string; endDate: string }[] = [];
+    const today = new Date();
+    // Go back 6 months, forward 1 month
+    for (let i = -1; i <= 6; i++) {
+      const base = new Date(today.getFullYear(), today.getMonth() - i, 1);
+      const startD = new Date(base.getFullYear(), base.getMonth() - 1, 25);
+      const endD   = new Date(base.getFullYear(), base.getMonth(), 24);
+      const start  = format(startD, 'yyyy-MM-dd');
+      const end    = format(endD,   'yyyy-MM-dd');
+      const label  = `${format(startD, 'MMM d')} – ${format(endD, 'MMM d, yyyy')}`;
+      opts.push({ label, startDate: start, endDate: end });
+    }
+    return opts;
+  }, []);
+
+  // Build date columns for the selected cycle
+  const dateCols = useMemo(() => {
+    const cols: { date: string; dayOfWeek: number; label: string; shortDay: string; ordinal: string }[] = [];
+    const start = new Date(selectedCycle.startDate + 'T00:00:00');
+    const end   = new Date(selectedCycle.endDate   + 'T00:00:00');
+    for (let d = new Date(start); d <= end; d.setDate(d.getDate() + 1)) {
+      cols.push({
+        date:      format(d, 'yyyy-MM-dd'),
+        dayOfWeek: d.getDay(),
+        label:     format(d, 'dd-MM-yyyy'),
+        shortDay:  format(d, 'EEE'),
+        ordinal:   format(d, 'do'),
+      });
+    }
+    return cols;
+  }, [selectedCycle]);
+
+  // Group consecutive weekend days for merged header display
+  const weekendGroups = useMemo(() => {
+    const groups: { indices: number[]; label: string }[] = [];
+    let i = 0;
+    while (i < dateCols.length) {
+      if (dateCols[i].dayOfWeek === 0 || dateCols[i].dayOfWeek === 6) {
+        const start = i;
+        while (i < dateCols.length && (dateCols[i].dayOfWeek === 0 || dateCols[i].dayOfWeek === 6)) i++;
+        groups.push({
+          indices: dateCols.slice(start, i).map((_, k) => start + k),
+          label: dateCols.slice(start, i).map(c => c.ordinal).join(' & '),
+        });
+      } else { i++; }
+    }
+    return groups;
+  }, [dateCols]);
+
+  const weekendIndexSet = useMemo(() =>
+    new Set(dateCols.flatMap((c, i) => (c.dayOfWeek === 0 || c.dayOfWeek === 6) ? [i] : [])),
+  [dateCols]);
+
+  // Get per-employee per-day status
+  const getStatus = (userId: string, dateStr: string): 'present' | 'half' | 'absent' | 'weekend' => {
+    const col = dateCols.find(c => c.date === dateStr);
+    if (col && (col.dayOfWeek === 0 || col.dayOfWeek === 6)) return 'weekend';
+    const dayLogs = allLogs.filter(l => l.userId === userId && l.timestamp.startsWith(dateStr));
+    if (dayLogs.length === 0) return 'absent';
+    const { totalMinutes } = calculateTotalHours(dayLogs);
+    if (totalMinutes >= 480) return 'present';
+    if (totalMinutes >= 60)  return 'half';
+    const hasLogin = dayLogs.some(l => l.type === 'login');
+    return hasLogin ? 'half' : 'absent';
+  };
+
+  const employees = allUsers.filter(u => !u.isDeleted && u.role === 'user')
+    .filter(u => u.name.toLowerCase().includes(search.toLowerCase()) ||
+                 (u.employeeId || '').toLowerCase().includes(search.toLowerCase()));
+
+  const handleExportCSV = () => {
+    const dateHeaders = dateCols.map(c => `${c.shortDay} ${c.label}`);
+    const headers = ['S.No', 'Employee ID', 'Name', 'DOJ', ...dateHeaders];
+    const rows = employees.map((u, idx) => [
+      idx + 1,
+      u.employeeId || '—',
+      u.name,
+      u.joiningDate ? format(new Date(u.joiningDate), 'MMM do') : '—',
+      ...dateCols.map(c => {
+        const s = getStatus(u.id, c.date);
+        return s === 'present' ? 'Present' : s === 'half' ? 'Half a day' : s === 'weekend' ? 'Weekend' : 'Absent';
+      }),
+    ]);
+    const csv = [headers, ...rows].map(r => r.join(',')).join('\n');
+    const blob = new Blob([csv], { type: 'text/csv;charset=utf-8;' });
+    const link = document.createElement('a');
+    link.href = URL.createObjectURL(blob);
+    link.download = `attendance-${selectedCycle.startDate}-to-${selectedCycle.endDate}.csv`;
+    link.click();
+  };
+
+  const statusCell = (s: 'present' | 'half' | 'absent' | 'weekend') => {
+    if (s === 'present') return <td className="text-center px-2 py-1.5 text-xs font-medium text-green-800 bg-green-100 whitespace-nowrap border-r border-gray-100">Present</td>;
+    if (s === 'half')    return <td className="text-center px-2 py-1.5 text-xs font-medium text-amber-800 bg-amber-100 whitespace-nowrap border-r border-gray-100">Half a day</td>;
+    if (s === 'weekend') return <td className="text-center px-2 py-1.5 bg-orange-50 border-r border-orange-100 text-xs text-orange-300">—</td>;
+    return <td className="text-center px-2 py-1.5 text-xs font-medium text-white bg-red-500 whitespace-nowrap border-r border-gray-100">Absent</td>;
+  };
+
+  return (
+    <DashboardLayout title="Attendance Report" showBack>
+      <div className="mb-5 flex flex-col sm:flex-row gap-3 justify-between items-start sm:items-center">
+        <div>
+          <h2 className="text-2xl font-black text-gray-900">Attendance Report</h2>
+          <div className="flex items-center gap-2 mt-0.5">
+            <span className="text-sm text-gray-500">25th–24th cycles · Green = Present · Orange = Half Day · Red = Absent</span>
+            {refreshing && <span className="text-xs text-indigo-500 animate-pulse">Refreshing…</span>}
+            {lastUpdated && !refreshing && (
+              <span className="text-xs text-gray-400">· Updated {format(lastUpdated, 'h:mm a')}</span>
+            )}
+          </div>
+          <div className="flex items-center gap-1.5 mt-1">
+            <span className="w-2 h-2 rounded-full bg-emerald-500 animate-pulse inline-block"></span>
+            <span className="text-xs text-emerald-600 font-medium">Live — auto-refreshes every 5 min</span>
+          </div>
+        </div>
+        <div className="flex flex-wrap gap-2 items-center">
+          <input
+            type="text"
+            placeholder="Search employee…"
+            value={search}
+            onChange={e => setSearch(e.target.value)}
+            className="px-3 py-2 border border-gray-200 rounded-xl text-sm outline-none focus:ring-2 focus:ring-indigo-500 w-44"
+          />
+          <select
+            value={selectedCycle.startDate}
+            onChange={e => {
+              const found = cycleOptions.find(o => o.startDate === e.target.value);
+              if (found) setSelectedCycle(found);
+            }}
+            className="px-3 py-2 bg-white border border-gray-200 rounded-xl text-sm font-medium text-gray-700 focus:ring-2 focus:ring-indigo-500 outline-none shadow-sm"
+          >
+            {cycleOptions.map(o => (
+              <option key={o.startDate} value={o.startDate}>{o.label}</option>
+            ))}
+          </select>
+          <button
+            onClick={() => fetchData(true)}
+            disabled={refreshing}
+            className="px-3 py-2 bg-white border border-gray-200 rounded-xl text-sm font-medium text-gray-600 hover:bg-gray-50 disabled:opacity-50 flex items-center gap-1.5 shadow-sm"
+          >
+            <RefreshCw size={14} className={refreshing ? 'animate-spin' : ''} />
+            Refresh
+          </button>
+          <Button variant="primary" icon={Download} onClick={handleExportCSV}>Export CSV</Button>
+        </div>
+      </div>
+
+      {loading ? (
+        <div className="flex items-center justify-center h-48 text-gray-400">Loading…</div>
+      ) : (
+        <div className="bg-white rounded-2xl border border-gray-100 shadow-sm overflow-hidden">
+          {/* Legend */}
+          <div className="flex gap-4 px-4 py-3 border-b border-gray-100 text-xs font-medium flex-wrap">
+            <span className="flex items-center gap-1.5"><span className="px-2 py-0.5 rounded bg-green-100 text-green-800 text-[10px] font-medium">Present</span></span>
+            <span className="flex items-center gap-1.5"><span className="px-2 py-0.5 rounded bg-amber-100 text-amber-800 text-[10px] font-medium">Half a day</span></span>
+            <span className="flex items-center gap-1.5"><span className="px-2 py-0.5 rounded bg-red-500 text-white text-[10px] font-medium">Absent</span></span>
+            <span className="flex items-center gap-1.5"><span className="px-2 py-0.5 rounded bg-orange-50 text-orange-300 text-[10px]">Weekend</span></span>
+          </div>
+
+          <div className="overflow-x-auto">
+            <table className="text-xs border-collapse min-w-max">
+              <thead>
+                <tr className="bg-gray-50 border-b border-gray-200">
+                  <th className="px-2 py-2.5 text-left font-semibold text-gray-600 sticky left-0 bg-gray-50 border-r border-gray-200 whitespace-nowrap min-w-[30px]">S.No</th>
+                  <th className="px-2 py-2.5 text-left font-semibold text-gray-600 sticky left-8 bg-gray-50 border-r border-gray-200 whitespace-nowrap min-w-[90px]">Emp ID</th>
+                  <th className="px-3 py-2.5 text-left font-semibold text-gray-600 sticky left-24 bg-gray-50 border-r border-gray-200 whitespace-nowrap min-w-[140px]">Name</th>
+                  <th className="px-2 py-2.5 text-left font-semibold text-gray-600 border-r border-gray-200 whitespace-nowrap min-w-[70px]">DOJ</th>
+                  {dateCols.map((c, i) => {
+                    const isWeekend = weekendIndexSet.has(i);
+                    // Check if this is the first day of a weekend group
+                    const group = weekendGroups.find(g => g.indices[0] === i);
+                    if (isWeekend && !group) return null; // skip non-first weekend cols (handled by colspan)
+                    if (group) {
+                      return (
+                        <th key={c.date} colSpan={group.indices.length}
+                          className="text-center font-semibold text-orange-600 bg-orange-50 border-r border-orange-200 whitespace-nowrap px-1 py-2.5">
+                          {group.label}
+                        </th>
+                      );
+                    }
+                    return (
+                      <th key={c.date} className="text-center font-semibold text-gray-600 border-r border-gray-100 whitespace-nowrap px-2 py-2 min-w-[90px] text-[11px]">
+                        {c.label}
+                      </th>
+                    );
+                  })}
+                </tr>
+              </thead>
+              <tbody className="divide-y divide-gray-50">
+                {employees.length === 0 ? (
+                  <tr><td colSpan={4 + dateCols.length} className="py-12 text-center text-gray-400">No employees found.</td></tr>
+                ) : employees.map((u, idx) => (
+                  <tr key={u.id} className="hover:bg-indigo-50/30 transition-colors">
+                    <td className="px-2 py-1.5 text-gray-400 sticky left-0 bg-white border-r border-gray-100">{idx + 1}</td>
+                    <td className="px-2 py-1.5 text-gray-500 sticky left-8 bg-white border-r border-gray-100 font-mono text-[10px]">{u.employeeId || '—'}</td>
+                    <td className="px-3 py-1.5 font-semibold text-gray-800 sticky left-24 bg-white border-r border-gray-100 whitespace-nowrap">{u.name}</td>
+                    <td className="px-2 py-1.5 text-gray-500 border-r border-gray-100 whitespace-nowrap">
+                      {u.joiningDate ? format(new Date(u.joiningDate), 'MMM d') : '—'}
+                    </td>
+                    {dateCols.map((c, i) => {
+                      if (weekendIndexSet.has(i)) {
+                        const group = weekendGroups.find(g => g.indices[0] === i);
+                        if (!group) return null;
+                        return <td key={c.date} colSpan={group.indices.length} className="bg-orange-50 border-r border-orange-100 text-center text-orange-300 text-[10px]">—</td>;
+                      }
+                      return <React.Fragment key={c.date}>{statusCell(getStatus(u.id, c.date))}</React.Fragment>;
+                    })}
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+
+          {/* Summary footer */}
+          <div className="px-4 py-3 border-t border-gray-100 text-xs text-gray-500 flex gap-6 flex-wrap">
+            <span>Total employees: <strong className="text-gray-700">{employees.length}</strong></span>
+            <span>Period: <strong className="text-gray-700">{selectedCycle.label}</strong></span>
+          </div>
+        </div>
+      )}
+    </DashboardLayout>
+  );
+};
+
+const AdminAttendanceReport    = () => <AttendanceReportPage rangeEndpoint="/api/admin/attendance-range" />;
+const TeamLeadAttendanceReport = () => <AttendanceReportPage rangeEndpoint="/api/teamlead/attendance-range" />;
 
 // Keep old AdminMonthlyReport_UNUSED for reference — delete later
 const AdminMonthlyReport_UNUSED = () => {
@@ -6263,6 +6535,8 @@ export default function App() {
             element={user && user.role === 'teamlead' ? <TeamLeadDashboard /> : <Navigate to="/login" replace />} />
           <Route path="/teamlead/monthly"
             element={user && user.role === 'teamlead' ? <TeamLeadMonthlyReport /> : <Navigate to="/login" replace />} />
+          <Route path="/teamlead/attendance"
+            element={user && user.role === 'teamlead' ? <TeamLeadAttendanceReport /> : <Navigate to="/login" replace />} />
 
           {/* Admin routes */}
           <Route path="/admin"
@@ -6271,6 +6545,8 @@ export default function App() {
             element={user && user.role === 'admin' ? <AdminUsersPage /> : <Navigate to="/admin/login" replace />} />
           <Route path="/admin/monthly"
             element={user && user.role === 'admin' ? <AdminMonthlyReport /> : <Navigate to="/admin/login" replace />} />
+          <Route path="/admin/attendance"
+            element={user && user.role === 'admin' ? <AdminAttendanceReport /> : <Navigate to="/admin/login" replace />} />
 
           <Route path="/" element={<LandingPage />} />
         </Routes>
